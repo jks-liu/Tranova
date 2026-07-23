@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+*.log
+.DS_Store
+Thumbs.db
+src-tauri/.tranova-data/
+.tranova-test-data/
+.tranova-visual-check/
+test-results/
+playwright-report/
