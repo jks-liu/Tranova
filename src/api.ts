@@ -3,6 +3,7 @@ import type {
   BootstrapData,
   FileJobResult,
   Glossary,
+  HistoryEntry,
   PromptTemplate,
   Provider,
   TranslateRequest,
@@ -36,6 +37,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   bootstrap: () => request<BootstrapData>("/bootstrap"),
+  history: () => request<HistoryEntry[]>("/history"),
   translate: (payload: TranslateRequest) =>
     request<TranslationResult>("/translate", { method: "POST", body: JSON.stringify(payload) }),
   translateFile: async (file: File, options: Omit<TranslateRequest, "text">) => {
@@ -58,4 +60,10 @@ export const api = {
     request<AppSettings>("/settings", { method: "PUT", body: JSON.stringify(settings) }),
   importData: (kind: "glossaries" | "prompts", data: unknown) =>
     request<BootstrapData>(`/import/${kind}`, { method: "POST", body: JSON.stringify(data) }),
+  deleteHistory: (id: string) => request<void>(`/history/${encodeURIComponent(id)}`, { method: "DELETE" }),
+  clearHistory: () => request<void>("/history", { method: "DELETE" }),
+  readDroppedFile: async (path: string) => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<{ name: string; contentBase64: string }>("read_dropped_file", { path });
+  },
 };

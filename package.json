@@ -1,7 +1,7 @@
 {
   "name": "tranova",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run src",
     "test:e2e": "npm run build && playwright test",
+    "version:bump": "node scripts/bump-version.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

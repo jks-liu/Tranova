@@ -5,7 +5,7 @@ import { api } from "../api";
 import { TranslationOptions, type TranslationOptionsValue } from "../components/TranslationOptions";
 import type { BootstrapData } from "../types";
 
-export function TranslatePage({ data }: { data: BootstrapData }) {
+export function TranslatePage({ data, onReload }: { data: BootstrapData; onReload: () => Promise<void> }) {
   const { t } = useTranslation();
   const defaultProvider = useMemo(() => data.providers.find((provider) => provider.enabled)?.id || "", [data.providers]);
   const [options, setOptions] = useState<TranslationOptionsValue>({ sourceLanguage: "auto", targetLanguage: "zh", providerId: defaultProvider, promptId: data.prompts[0]?.id || "", glossaryIds: [] });
@@ -26,6 +26,7 @@ export function TranslatePage({ data }: { data: BootstrapData }) {
     try {
       const response = await api.translate({ text: source, ...options, promptId: options.promptId || undefined });
       setResult(response.translatedText);
+      await onReload();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {

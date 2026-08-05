@@ -31,3 +31,15 @@
         - LLM Studio
         - Ollama
 - 支持Windows，Linux，Mac。如果可以的话，也请为手机打包（无需web功能），如果无法实现或实现复杂就算了。
+
+
+- 打开软件后有个黑框，请去除
+- 翻译语言除了列表中的语言，还应允许用户自定义
+- 翻译word文档时，会有以下错误：missing field `text` at line 1 column 150
+- drop file 仅在网页版有效，desptop版无效
+- source / target language加一个switch按钮
+- 加一个历史记录功能
+- 打开后无任何操作也会占用很高的CPU，分别是：
+    * webView2管理器
+    * webView2：tranova
+    * webView2实用工具：network service

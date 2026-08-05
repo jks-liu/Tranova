@@ -18,8 +18,8 @@ use tower_http::{
 use crate::{
     ai, files,
     models::{
-        AppData, AppSettings, FileJobResult, Glossary, PromptTemplate, Provider, TranslateRequest,
-        TranslationResult,
+        AppData, AppSettings, FileJobResult, Glossary, HistoryEntry, PromptTemplate, Provider,
+        TranslateOptions, TranslateRequest, TranslationResult,
     },
     store::AppStore,
 };
@@ -37,6 +37,7 @@ struct BootstrapResponse {
     glossaries: Vec<Glossary>,
     prompts: Vec<PromptTemplate>,
     settings: AppSettings,
+    history: Vec<HistoryEntry>,
     server_url: String,
 }
 
@@ -55,7 +56,6 @@ pub async fn start_server(
         ServeDir::new(&asset_dir).not_found_service(ServeFile::new(asset_dir.join("index.html"))),
     );
     let listener = tokio::net::TcpListener::bind((host, port)).await?;
-    eprintln!("Tranova Web is listening at http://{host}:{port}");
     axum::serve(listener, app).await.map_err(io::Error::other)
 }
 
@@ -72,6 +72,8 @@ fn api_router(state: ServerState) -> Router {
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/translate", post(translate))
         .route("/api/translate-file", post(translate_file))
+        .route("/api/history", get(history).delete(clear_history))
+        .route("/api/history/{id}", delete(delete_history))
         .route("/api/providers", put(save_provider))
         .route("/api/providers/{id}", delete(delete_provider))
         .route("/api/providers/{id}/test", post(test_provider))
@@ -104,12 +106,14 @@ async fn bootstrap(State(state): State<ServerState>) -> Json<BootstrapResponse> 
         glossaries,
         prompts,
         settings,
+        history,
     } = state.store.snapshot();
     Json(BootstrapResponse {
         providers,
         glossaries,
         prompts,
         settings,
+        history,
         server_url: state.server_url,
     })
 }
@@ -118,11 +122,14 @@ async fn translate(
     State(state): State<ServerState>,
     Json(request): Json<TranslateRequest>,
 ) -> Result<Json<TranslationResult>, ApiError> {
-    Ok(Json(
-        ai::translate(&state.store, &request)
-            .await
-            .map_err(ApiError::from_ai)?,
-    ))
+    let result = ai::translate(&state.store, &request)
+        .await
+        .map_err(ApiError::from_ai)?;
+    state
+        .store
+        .add_history(history_for_text(&request, &result))
+        .map_err(ApiError::from_io)?;
+    Ok(Json(result))
 }
 
 async fn translate_file(
@@ -130,7 +137,7 @@ async fn translate_file(
     mut multipart: Multipart,
 ) -> Result<Json<FileJobResult>, ApiError> {
     let mut file: Option<(String, Vec<u8>)> = None;
-    let mut options: Option<TranslateRequest> = None;
+    let mut options: Option<TranslateOptions> = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -158,11 +165,80 @@ async fn translate_file(
     let (filename, bytes) = file.ok_or_else(|| ApiError::bad_request("A file is required"))?;
     let options =
         options.ok_or_else(|| ApiError::bad_request("Translation options are required"))?;
-    Ok(Json(
-        files::translate_file(&state.store, &filename, bytes, options)
-            .await
-            .map_err(ApiError::from_file)?,
-    ))
+    let request = options.into_request();
+    let result = files::translate_file(&state.store, &filename, bytes, request.clone())
+        .await
+        .map_err(ApiError::from_file)?;
+    state
+        .store
+        .add_history(history_for_file(&request, &result))
+        .map_err(ApiError::from_io)?;
+    Ok(Json(result))
+}
+
+async fn delete_history(
+    State(state): State<ServerState>,
+    Path(id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    state.store.delete_history(&id).map_err(ApiError::from_io)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn clear_history(State(state): State<ServerState>) -> Result<StatusCode, ApiError> {
+    state.store.clear_history().map_err(ApiError::from_io)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn history(State(state): State<ServerState>) -> Json<Vec<HistoryEntry>> {
+    Json(state.store.snapshot().history)
+}
+
+fn history_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{}", timestamp, std::process::id())
+}
+
+fn history_for_text(request: &TranslateRequest, result: &TranslationResult) -> HistoryEntry {
+    HistoryEntry {
+        id: history_id(),
+        kind: "text".to_string(),
+        source_language: request.source_language.clone(),
+        target_language: request.target_language.clone(),
+        source_text: request.text.clone(),
+        translated_text: result.translated_text.clone(),
+        filename: None,
+        provider: result.provider.clone(),
+        model: result.model.clone(),
+        created_at: unix_timestamp(),
+    }
+}
+
+fn history_for_file(request: &TranslateRequest, result: &FileJobResult) -> HistoryEntry {
+    HistoryEntry {
+        id: history_id(),
+        kind: "file".to_string(),
+        source_language: request.source_language.clone(),
+        target_language: request.target_language.clone(),
+        source_text: String::new(),
+        translated_text: String::new(),
+        filename: Some(result.filename.clone()),
+        provider: request.provider_id.clone(),
+        model: String::new(),
+        created_at: unix_timestamp(),
+    }
+}
+
+fn unix_timestamp() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    format!("{seconds}")
 }
 
 async fn save_provider(
@@ -272,12 +348,14 @@ async fn import_data(
         glossaries,
         prompts,
         settings,
+        history,
     } = state.store.snapshot();
     Ok(Json(BootstrapResponse {
         providers,
         glossaries,
         prompts,
         settings,
+        history,
         server_url: state.server_url,
     }))
 }

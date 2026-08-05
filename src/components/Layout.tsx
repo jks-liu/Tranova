@@ -1,9 +1,9 @@
 import type { ReactNode } from "react";
-import { Bot, FileText, Languages, Library, Menu, Settings, Sparkles, X } from "lucide-react";
+import { Bot, FileText, History, Languages, Library, Menu, Settings, Sparkles, X } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
-export type View = "translate" | "files" | "glossaries" | "prompts" | "providers" | "settings";
+export type View = "translate" | "files" | "history" | "glossaries" | "prompts" | "providers" | "settings";
 
 interface LayoutProps {
   view: View;
@@ -18,6 +18,7 @@ export function Layout({ view, onViewChange, children, connected }: LayoutProps)
   const items: Array<{ id: View; icon: typeof Languages; label: string }> = [
     { id: "translate", icon: Languages, label: t("nav.translate") },
     { id: "files", icon: FileText, label: t("nav.files") },
+    { id: "history", icon: History, label: t("nav.history") },
     { id: "glossaries", icon: Library, label: t("nav.glossaries") },
     { id: "prompts", icon: Sparkles, label: t("nav.prompts") },
     { id: "providers", icon: Bot, label: t("nav.providers") },

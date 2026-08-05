@@ -5,6 +5,7 @@ import { api, initializeApi } from "./api";
 import { Layout, type View } from "./components/Layout";
 import { FilesPage } from "./pages/FilesPage";
 import { GlossariesPage } from "./pages/GlossariesPage";
+import { HistoryPage } from "./pages/HistoryPage";
 import { PromptsPage } from "./pages/PromptsPage";
 import { ProvidersPage } from "./pages/ProvidersPage";
 import { SettingsPage } from "./pages/SettingsPage";
@@ -31,13 +32,16 @@ export default function App() {
           await new Promise((resolve) => window.setTimeout(resolve, 150));
         }
       }
-      if (!next) throw lastError || new Error(t("status.backendUnavailable"));
-      setData(next);
-      if (!localStorage.getItem("tranova-language")) await i18n.changeLanguage(next.settings.language);
+      if (!next) throw lastError || new Error(i18n.t("status.backendUnavailable"));
+      setData({ ...next, history: next.history || [] });
+      if (!localStorage.getItem("tranova-language")) {
+        localStorage.setItem("tranova-language", next.settings.language);
+        if (i18n.language !== next.settings.language) await i18n.changeLanguage(next.settings.language);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
-  }, [i18n, t]);
+  }, [i18n]);
 
   useEffect(() => { void load(); }, [load]);
 
@@ -52,8 +56,9 @@ export default function App() {
   }
 
   const pages: Record<View, React.ReactNode> = {
-    translate: <TranslatePage data={data} />,
-    files: <FilesPage data={data} />,
+    translate: <TranslatePage data={data} onReload={load} />,
+    files: <FilesPage data={data} onReload={load} />,
+    history: <HistoryPage data={data} onReload={load} />,
     glossaries: <GlossariesPage data={data} onReload={load} />,
     prompts: <PromptsPage data={data} onReload={load} />,
     providers: <ProvidersPage data={data} onReload={load} />,

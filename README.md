@@ -5,6 +5,8 @@ Tranova is a Tauri-based AI translation studio for text and documents. The deskt
 ## Features
 
 - Text translation with reusable prompt templates and any number of selected glossaries.
+- Preset or custom source and target languages, including a one-click language swap.
+- Persistent translation history shared by the desktop app and local Web interface.
 - Import and export of prompts and glossaries as JSON.
 - Cloud AI providers: OpenAI, DeepSeek and Doubao.
 - Local AI providers: llama.cpp, LM Studio and Ollama.
@@ -16,18 +18,47 @@ Tranova is a Tauri-based AI translation studio for text and documents. The deskt
 
 Office Open XML documents are unpacked locally. Tranova extracts paragraph or text-block content, translates it, replaces the original text, and writes a new document while retaining the package structure and formatting data. Images are left unchanged unless image support is explicitly enabled for the selected provider.
 
-## Development
+## Build and Run
 
-Prerequisites: Node.js 20 or newer, Rust 1.77 or newer, and the platform prerequisites for Tauri 2.
+### Prerequisites
+
+- Node.js 20 or newer and npm.
+- Rust 1.77 or newer with Cargo.
+- The platform prerequisites for Tauri 2. On Windows, install the WebView2 Runtime and Visual Studio Build Tools with the Desktop C++ workload and Windows SDK.
+- A configured AI provider is required before a translation can be performed.
+
+Check the toolchain before installing dependencies:
 
 ```powershell
-npm install
+node --version
+npm --version
+rustc --version
+cargo --version
+```
+
+### Install
+
+Run these commands from the repository root:
+
+```powershell
+npm ci
+```
+
+Use `npm install` instead when `package-lock.json` is intentionally being updated.
+
+### Desktop development
+
+Start the Tauri desktop application with:
+
+```powershell
 npm run tauri dev
 ```
 
-The Tauri development command starts Vite at `http://localhost:1420` and the local API/Web service at `http://127.0.0.1:48731`.
+This starts the Vite frontend at `http://localhost:1420` and the local API service at `http://127.0.0.1:48731`. Do not add `--server` to this command; `--server` is for the standalone Web service and does not open a desktop window.
 
-To run the Web service without opening a desktop window, first build the frontend and Rust binary:
+### Frontend and standalone Web development
+
+To run the Web interface without a Tauri window, build the frontend and start the Rust server separately:
 
 ```powershell
 npm run build
@@ -35,9 +66,54 @@ cargo build --manifest-path src-tauri/Cargo.toml
 src-tauri\target\debug\tranova.exe --server
 ```
 
-On Linux or macOS, run the equivalent binary at `src-tauri/target/debug/tranova --server`.
+Open `http://127.0.0.1:48731` in a browser. On Linux or macOS, use `src-tauri/target/debug/tranova --server` instead. The standalone server is intended for Web access and automated tests; normal desktop users should launch the Tauri application.
 
-## Verification
+### Release builds
+
+Build the frontend and an unbundled optimized desktop executable:
+
+```powershell
+npm run tauri build -- --no-bundle
+```
+
+The executable is written to `src-tauri/target/release/tranova.exe` on Windows (or `src-tauri/target/release/tranova` on Linux/macOS). This is useful for a quick local smoke test, but it does not create an installer.
+
+To create the platform installer and bundled application:
+
+```powershell
+npm run tauri build
+```
+
+Artifacts are placed under `src-tauri/target/release/bundle/`. The exact subdirectory and file type depend on the host operating system and the configured Tauri bundle targets.
+
+### Versioning
+
+Use the version bump script so npm, Cargo and Tauri metadata stay synchronized:
+
+```powershell
+# 0.1.1 -> 0.1.2 (default)
+npm run version:bump
+
+# Bump and build the Tauri installer/application
+npm run version:bump -- patch --build
+
+# Or choose the release level explicitly
+npm run version:bump -- minor
+npm run version:bump -- major
+
+# Or set an exact version
+npm run version:bump -- 1.0.0
+
+# Explicitly skip the build (the default behavior)
+npm run version:bump -- patch --no-build
+```
+
+The script updates `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` and `src-tauri/tauri.conf.json`. It stops before writing if any of those files contain a different current version.
+By default it only updates version metadata. Add `--build` to run `npm run tauri build` after the update; use `--no-build` to make the choice explicit.
+
+### Verification
+
+Run the focused checks before packaging:
 
 ```powershell
 npm test
@@ -45,10 +121,16 @@ npm run build
 cargo fmt --manifest-path src-tauri/Cargo.toml -- --check
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
-npm run tauri build -- --no-bundle
 ```
 
-`npm run test:e2e` starts an isolated Web service and verifies desktop, mobile and Simplified Chinese layouts. Run `npx playwright install chromium` once if no Playwright browser is installed.
+The end-to-end suite starts its own isolated Web service and checks desktop, mobile and Simplified Chinese layouts:
+
+```powershell
+npx playwright install chromium
+npm run test:e2e
+```
+
+The browser installation command is only needed once per machine. If Chromium is unavailable, set `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH` to a compatible local Chromium or Edge executable.
 
 ## Configuration and data
 
@@ -56,12 +138,18 @@ Configure at least one enabled AI provider before translating. Provider API keys
 
 Changes to the Web listening address or port take effect after restarting Tranova. The default prompt can be edited but is retained if deletion is requested, ensuring a usable translation instruction is always available.
 
-## Packaging
+## Troubleshooting
 
-Tauri is configured for Windows, Linux and macOS. Platform icons are included for Windows, macOS, Linux, Android and iOS. Desktop artifacts can be built on each target operating system with:
+The desktop app and standalone Web server use port `48731` by default. Only one process can listen on that port:
 
 ```powershell
-npm run tauri build
+Get-NetTCPConnection -LocalPort 48731 -ErrorAction SilentlyContinue
 ```
 
-Mobile packaging is not enabled in this release because the current architecture intentionally exposes no Web service on mobile and would require a separate Tauri command transport for feature parity.
+Close an existing Tranova instance before starting another standalone server or running the end-to-end suite. The Web address and port can also be changed in Settings; restart Tranova after changing them.
+
+For isolated tests or development data, set `TRANOVA_DATA_DIR` to a separate directory before starting the server. This prevents test providers, prompts, glossaries and history from changing your normal application data.
+
+## Platform notes
+
+Tauri desktop packaging is configured for Windows, Linux and macOS. Mobile packaging is not enabled in this release because the current architecture intentionally exposes no Web service on mobile and would require a separate Tauri command transport for feature parity.

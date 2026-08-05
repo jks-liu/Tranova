@@ -1,5 +1,5 @@
 import { Download, FileText, UploadCloud } from "lucide-react";
-import { useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { TranslationOptions, type TranslationOptionsValue } from "../components/TranslationOptions";
@@ -16,7 +16,7 @@ function downloadResult(result: FileJobResult) {
   URL.revokeObjectURL(url);
 }
 
-export function FilesPage({ data }: { data: BootstrapData }) {
+export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: () => Promise<void> }) {
   const { t } = useTranslation();
   const inputRef = useRef<HTMLInputElement>(null);
   const defaultProvider = useMemo(() => data.providers.find((provider) => provider.enabled)?.id || "", [data.providers]);
@@ -26,13 +26,42 @@ export function FilesPage({ data }: { data: BootstrapData }) {
   const [working, setWorking] = useState(false);
   const [error, setError] = useState("");
 
-  const choose = (next: File | undefined) => {
+  const choose = useCallback((next: File | undefined) => {
     if (next) {
       setFile(next);
       setResult(null);
       setError("");
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void import("@tauri-apps/api/webview")
+      .then(({ getCurrentWebview }) => getCurrentWebview().onDragDropEvent(async (event) => {
+        if (event.payload.type !== "drop" || !event.payload.paths[0]) return;
+        try {
+          const dropped = await api.readDroppedFile(event.payload.paths[0]);
+          if (disposed) return;
+          const bytes = Uint8Array.from(atob(dropped.contentBase64), (character) => character.charCodeAt(0));
+          choose(new File([bytes], dropped.name, { type: mimeTypeForName(dropped.name) }));
+        } catch (reason) {
+          if (!disposed) setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      }))
+      .then((stop) => {
+        if (disposed) stop();
+        else unlisten = stop;
+      })
+      .catch((reason) => {
+        if (!disposed) setError(reason instanceof Error ? reason.message : String(reason));
+      });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [choose]);
 
   const translate = async () => {
     if (!file || !options.providerId) return;
@@ -40,6 +69,7 @@ export function FilesPage({ data }: { data: BootstrapData }) {
     setError("");
     try {
       setResult(await api.translateFile(file, { ...options, promptId: options.promptId || undefined }));
+      await onReload();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -77,4 +107,25 @@ export function FilesPage({ data }: { data: BootstrapData }) {
       </div>
     </section>
   );
+}
+
+function mimeTypeForName(filename: string) {
+  const extension = filename.split(".").pop()?.toLowerCase();
+  const types: Record<string, string> = {
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    txt: "text/plain",
+    md: "text/markdown",
+    markdown: "text/markdown",
+    html: "text/html",
+    htm: "text/html",
+    csv: "text/csv",
+    json: "application/json",
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    webp: "image/webp",
+  };
+  return (extension && types[extension]) || "application/octet-stream";
 }

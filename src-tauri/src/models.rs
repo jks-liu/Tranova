@@ -112,6 +112,8 @@ pub struct AppData {
     pub glossaries: Vec<Glossary>,
     #[serde(default)]
     pub settings: AppSettings,
+    #[serde(default)]
+    pub history: Vec<HistoryEntry>,
 }
 
 fn default_prompts() -> Vec<PromptTemplate> {
@@ -130,7 +132,69 @@ impl Default for AppData {
             prompts: default_prompts(),
             glossaries: Vec::new(),
             settings: AppSettings::default(),
+            history: Vec::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryEntry {
+    pub id: String,
+    pub kind: String,
+    pub source_language: String,
+    pub target_language: String,
+    #[serde(default)]
+    pub source_text: String,
+    #[serde(default)]
+    pub translated_text: String,
+    #[serde(default)]
+    pub filename: Option<String>,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslateOptions {
+    pub source_language: String,
+    pub target_language: String,
+    pub provider_id: String,
+    #[serde(default)]
+    pub prompt_id: Option<String>,
+    #[serde(default)]
+    pub glossary_ids: Vec<String>,
+}
+
+impl TranslateOptions {
+    pub fn into_request(self) -> TranslateRequest {
+        TranslateRequest {
+            text: String::new(),
+            source_language: self.source_language,
+            target_language: self.target_language,
+            provider_id: self.provider_id,
+            prompt_id: self.prompt_id,
+            glossary_ids: self.glossary_ids,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TranslateOptions;
+
+    #[test]
+    fn file_translation_options_do_not_require_text() {
+        let options: TranslateOptions = serde_json::from_str(
+            r#"{"sourceLanguage":"en","targetLanguage":"zh","providerId":"provider","glossaryIds":[]}"#,
+        )
+        .unwrap();
+        let request = options.into_request();
+        assert!(request.text.is_empty());
+        assert_eq!(request.target_language, "zh");
     }
 }
 

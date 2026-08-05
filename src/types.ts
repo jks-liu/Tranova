@@ -52,7 +52,21 @@ export interface BootstrapData {
   glossaries: Glossary[];
   prompts: PromptTemplate[];
   settings: AppSettings;
+  history: HistoryEntry[];
   serverUrl: string;
+}
+
+export interface HistoryEntry {
+  id: string;
+  kind: "text" | "file" | string;
+  sourceLanguage: string;
+  targetLanguage: string;
+  sourceText: string;
+  translatedText: string;
+  filename?: string;
+  provider: string;
+  model: string;
+  createdAt: string;
 }
 
 export interface TranslateRequest {

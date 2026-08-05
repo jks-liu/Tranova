@@ -49,7 +49,7 @@ h1 { font-size: 26px; line-height: 1.2; margin-bottom: 7px; font-weight: 700; }
 .icon-button:hover:not(:disabled) { background: #e6ecee; color: #17212b; }
 .icon-button.danger:hover { background: #fdeae6; color: #b14c3e; }
 
-.translation-options { display: grid; grid-template-columns: repeat(4, minmax(125px, 1fr)) minmax(160px, 1.35fr); gap: 12px; background: #e8edef; border: 1px solid #d4dde1; padding: 13px; border-radius: 6px; margin-bottom: 16px; }
+.translation-options { display: grid; grid-template-columns: minmax(280px, 2fr) repeat(2, minmax(125px, 1fr)) minmax(160px, 1.35fr); gap: 12px; background: #e8edef; border: 1px solid #d4dde1; padding: 13px; border-radius: 6px; margin-bottom: 16px; }
 label span, fieldset legend { display: block; color: #60717b; font-size: 12px; font-weight: 600; margin-bottom: 6px; }
 input, select, textarea { width: 100%; border: 1px solid #c6d0d5; background: #fff; border-radius: 4px; color: #1b2733; }
 input, select { height: 36px; padding: 0 9px; }
@@ -57,6 +57,9 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
 .glossary-picker { min-width: 0; padding: 0; border: 0; }
 .glossary-picker legend { padding: 0; }
 .glossary-picker > div { min-height: 36px; display: flex; align-items: center; gap: 9px; overflow-x: auto; }
+.language-pair { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 34px minmax(0, 1fr); align-items: end; gap: 7px; }
+.language-input { min-width: 0; }
+.language-swap { margin-bottom: 1px; }
 .check-row { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; color: #33454f; font-size: 12px; }
 .check-row input { height: 14px; width: 14px; accent-color: #1c7c67; }
 .check-row span { margin: 0; font-size: 12px; color: inherit; font-weight: 500; }
@@ -88,6 +91,12 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
 .list-content strong, .list-content span { display: block; }
 .list-content strong { font-size: 14px; margin-bottom: 4px; }
 .list-content span { color: #687881; font-size: 12px; }
+.history-page { max-width: 980px; }
+.history-list { gap: 10px; }
+.history-item { align-items: flex-start; }
+.history-content { min-width: 0; }
+.history-preview { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 10px; }
+.history-preview span { min-width: 0; max-height: 90px; overflow: auto; padding: 8px 9px; white-space: pre-wrap; color: #4c5e67; background: #f5f8f8; border: 1px solid #e1e8e9; border-radius: 4px; line-height: 1.45; }
 .truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .badge { color: #677881; border: 1px solid #cbd6d9; background: #f6f8f9; border-radius: 20px; padding: 3px 8px; font-size: 11px; font-weight: 600; }
 .badge.enabled { color: #176b5a; background: #e8f5ee; border-color: #b5dbc3; }
@@ -136,6 +145,7 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
 @media (max-width: 980px) {
   main { padding: 31px 28px 60px; }
   .translation-options { grid-template-columns: repeat(2, 1fr); }
+  .language-pair { grid-column: 1 / -1; }
   .glossary-picker { grid-column: 1 / -1; }
 }
 @media (max-width: 720px) {
@@ -149,6 +159,7 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
   .page-heading { display: block; }
   .heading-actions { flex-wrap: wrap; margin-top: 17px; }
   .translation-options { grid-template-columns: 1fr 1fr; }
+  .language-pair { grid-column: 1 / -1; }
   .editor-grid { grid-template-columns: 1fr; min-height: 0; }
   .editor-panel textarea { min-height: 230px; }
   .result-panel { min-height: 230px; }
@@ -157,9 +168,11 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
   .provider-item .badge { margin-top: 11px; }
   .provider-item .list-actions { width: 100%; justify-content: flex-end; }
   .setting-row { grid-template-columns: 1fr; gap: 9px; }
+  .history-preview { grid-template-columns: 1fr; }
 }
 @media (max-width: 440px) {
   .translation-options { grid-template-columns: 1fr; }
+  .language-pair { grid-column: auto; }
   .glossary-picker { grid-column: auto; }
   .page-heading .primary-button { margin-top: 14px; }
   .heading-actions > * { flex: 1; }

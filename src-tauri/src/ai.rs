@@ -28,6 +28,11 @@ pub async fn translate(
     if request.text.trim().is_empty() {
         return Err(AiError::Message("Text to translate is empty".to_string()));
     }
+    if request.source_language.trim().is_empty() || request.target_language.trim().is_empty() {
+        return Err(AiError::Message(
+            "Source and target languages are required".to_string(),
+        ));
+    }
     let data = store.snapshot();
     let provider = data
         .providers

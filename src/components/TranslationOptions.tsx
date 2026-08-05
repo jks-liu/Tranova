@@ -1,3 +1,4 @@
+import { ArrowLeftRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { Glossary, PromptTemplate, Provider } from "../types";
 
@@ -32,19 +33,31 @@ export function TranslationOptions({ value, onChange, providers, prompts, glossa
 
   return (
     <div className="translation-options">
-      <label>
-        <span>{t("translate.sourceLanguage")}</span>
-        <select value={value.sourceLanguage} onChange={(event) => update({ sourceLanguage: event.target.value })}>
-          <option value="auto">{t("languages.auto")}</option>
-          {LANGUAGES.map((language) => <option key={language} value={language}>{t(`languages.${language}`)}</option>)}
-        </select>
-      </label>
-      <label>
-        <span>{t("translate.targetLanguage")}</span>
-        <select value={value.targetLanguage} onChange={(event) => update({ targetLanguage: event.target.value })}>
-          {LANGUAGES.map((language) => <option key={language} value={language}>{t(`languages.${language}`)}</option>)}
-        </select>
-      </label>
+      <div className="language-pair">
+        <LanguageInput
+          label={t("translate.sourceLanguage")}
+          value={value.sourceLanguage}
+          listId="tranova-source-languages"
+          allowAuto
+          onChange={(sourceLanguage) => update({ sourceLanguage })}
+        />
+        <button
+          className="icon-button language-swap"
+          type="button"
+          onClick={() => update({ sourceLanguage: value.targetLanguage, targetLanguage: value.sourceLanguage })}
+          disabled={value.sourceLanguage === "auto"}
+          title={t("translate.swapLanguages")}
+          aria-label={t("translate.swapLanguages")}
+        >
+          <ArrowLeftRight size={18} />
+        </button>
+        <LanguageInput
+          label={t("translate.targetLanguage")}
+          value={value.targetLanguage}
+          listId="tranova-target-languages"
+          onChange={(targetLanguage) => update({ targetLanguage })}
+        />
+      </div>
       <label>
         <span>{t("translate.provider")}</span>
         <select value={value.providerId} onChange={(event) => update({ providerId: event.target.value })}>
@@ -71,5 +84,37 @@ export function TranslationOptions({ value, onChange, providers, prompts, glossa
         </div>
       </fieldset>
     </div>
+  );
+}
+
+function LanguageInput({
+  label,
+  value,
+  listId,
+  allowAuto = false,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  listId: string;
+  allowAuto?: boolean;
+  onChange: (value: string) => void;
+}) {
+  const { t } = useTranslation();
+  return (
+    <label className="language-input">
+      <span>{label}</span>
+      <input
+        list={listId}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={t("languages.customPlaceholder")}
+        spellCheck={false}
+      />
+      <datalist id={listId}>
+        {allowAuto && <option value="auto" label={t("languages.auto")} />}
+        {LANGUAGES.map((language) => <option key={language} value={language} label={t(`languages.${language}`)} />)}
+      </datalist>
+    </label>
   );
 }

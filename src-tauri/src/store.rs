@@ -3,7 +3,7 @@ use std::{fs, io, path::PathBuf, sync::Arc};
 use directories::ProjectDirs;
 use parking_lot::RwLock;
 
-use crate::models::{AppData, AppSettings, Glossary, PromptTemplate, Provider};
+use crate::models::{AppData, AppSettings, Glossary, HistoryEntry, PromptTemplate, Provider};
 
 #[derive(Clone)]
 pub struct AppStore {
@@ -33,10 +33,7 @@ impl AppStore {
         fs::create_dir_all(directory)?;
         let path = directory.join("tranova-data.json");
         let data = match fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|error| {
-                eprintln!("Ignoring invalid Tranova data file: {error}");
-                AppData::default()
-            }),
+            Ok(contents) => serde_json::from_str(&contents).unwrap_or_else(|_| AppData::default()),
             Err(error) if error.kind() == io::ErrorKind::NotFound => AppData::default(),
             Err(error) => return Err(error),
         };
@@ -56,6 +53,39 @@ impl AppStore {
 
     pub fn settings(&self) -> AppSettings {
         self.inner.data.read().settings.clone()
+    }
+
+    pub fn add_history(&self, mut entry: HistoryEntry) -> Result<HistoryEntry, io::Error> {
+        if entry.id.trim().is_empty()
+            || entry.source_language.trim().is_empty()
+            || entry.target_language.trim().is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "History entry languages and id are required",
+            ));
+        }
+        entry.source_text = entry.source_text.chars().take(20_000).collect();
+        entry.translated_text = entry.translated_text.chars().take(20_000).collect();
+        let mut data = self.inner.data.write();
+        data.history.retain(|current| current.id != entry.id);
+        data.history.insert(0, entry.clone());
+        data.history.truncate(100);
+        drop(data);
+        self.persist()?;
+        Ok(entry)
+    }
+
+    pub fn delete_history(&self, id: &str) -> Result<(), io::Error> {
+        let mut data = self.inner.data.write();
+        data.history.retain(|entry| entry.id != id);
+        drop(data);
+        self.persist()
+    }
+
+    pub fn clear_history(&self) -> Result<(), io::Error> {
+        self.inner.data.write().history.clear();
+        self.persist()
     }
 
     pub fn save_provider(&self, provider: Provider) -> Result<Provider, io::Error> {
