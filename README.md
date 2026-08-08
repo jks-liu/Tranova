@@ -106,6 +106,9 @@ npm run version:bump -- 1.0.0
 
 # Explicitly skip the build (the default behavior)
 npm run version:bump -- patch --no-build
+
+# Show the current synchronized version without changing files
+npm run version:bump -- current
 ```
 
 The script updates `package.json`, `package-lock.json`, `src-tauri/Cargo.toml`, `src-tauri/Cargo.lock` and `src-tauri/tauri.conf.json`. It stops before writing if any of those files contain a different current version.

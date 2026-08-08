@@ -45,9 +45,12 @@ export interface AppSettings {
   webHost: string;
   webPort: number;
   maxChunkChars: number;
+  maxConcurrentAi: number;
+  aiTimeoutSeconds: number;
 }
 
 export interface BootstrapData {
+  version: string;
   providers: Provider[];
   glossaries: Glossary[];
   prompts: PromptTemplate[];
@@ -84,10 +87,27 @@ export interface TranslationResult {
   model: string;
 }
 
-export interface FileJobResult {
+export type FileOutputMode = "translated" | "bilingual";
+
+export type FileJobState = "queued" | "processing" | "completed" | "failed";
+
+export interface FileJobStatus {
+  id: string;
   filename: string;
-  mediaType: string;
-  contentBase64: string;
+  outputMode: FileOutputMode;
+  state: FileJobState;
+  stage: string;
+  totalSegments: number;
   translatedSegments: number;
   skippedSegments: number;
+  totalBatches: number;
+  completedBatches: number;
+  resultFilename: string;
+  mediaType: string;
+  error?: string;
+  createdAt: string;
+}
+
+export interface TranslateFileOptions extends Omit<TranslateRequest, "text"> {
+  outputMode: FileOutputMode;
 }

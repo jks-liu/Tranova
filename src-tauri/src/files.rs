@@ -1,6 +1,8 @@
-use std::io::{Cursor, Read, Write};
+use std::{
+    io::{Cursor, Read, Write},
+    sync::Arc,
+};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use quick_xml::{
     escape::unescape,
     events::{BytesText, Event},
@@ -8,11 +10,12 @@ use quick_xml::{
 };
 use serde_json::Value;
 use thiserror::Error;
+use tokio::task::JoinSet;
 use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::{
-    ai,
-    models::{FileJobResult, TranslateRequest},
+    models::{FileOutputMode, FileProgress, TranslateRequest},
+    scheduler::{AiScheduler, Priority},
     store::AppStore,
 };
 
@@ -32,80 +35,237 @@ pub enum FileError {
     Json(#[from] serde_json::Error),
 }
 
+pub type ProgressCallback = Arc<dyn Fn(FileProgress) + Send + Sync>;
+
+#[derive(Debug)]
+pub struct FileTranslationResult {
+    pub filename: String,
+    pub media_type: String,
+    pub content: Vec<u8>,
+    pub translated_segments: usize,
+    pub skipped_segments: usize,
+    pub total_segments: usize,
+    pub total_batches: usize,
+}
+
 #[derive(Default)]
 struct Counts {
     translated: usize,
     skipped: usize,
+    total_segments: usize,
+    total_batches: usize,
+    completed_batches: usize,
+    stage: String,
 }
 
 pub async fn translate_file(
     store: &AppStore,
+    scheduler: &AiScheduler,
     filename: &str,
     bytes: Vec<u8>,
     options: TranslateRequest,
-) -> Result<FileJobResult, FileError> {
+    output_mode: FileOutputMode,
+    progress: ProgressCallback,
+) -> Result<FileTranslationResult, FileError> {
     let extension = filename
         .rsplit('.')
         .next()
         .unwrap_or("")
         .to_ascii_lowercase();
-    let mut counts = Counts::default();
-    let translated = match extension.as_str() {
-        "docx" => translate_office(store, &bytes, &options, OfficeKind::Word, &mut counts).await?,
-        "pptx" => translate_office(store, &bytes, &options, OfficeKind::PowerPoint, &mut counts).await?,
-        "xlsx" => translate_office(store, &bytes, &options, OfficeKind::Excel, &mut counts).await?,
-        "json" => translate_json(store, &bytes, &options, &mut counts).await?,
-        "csv" => translate_csv(store, &bytes, &options, &mut counts).await?,
-        "srt" | "vtt" => translate_caption(store, &bytes, &options, &mut counts).await?,
-        "txt" | "md" | "markdown" | "html" | "htm" => translate_plain_file(store, &bytes, &options, &mut counts).await?,
-        "png" | "jpg" | "jpeg" | "webp" => translate_image_file(store, filename, bytes, &options, &mut counts).await?,
-        _ => return Err(FileError::Message("Unsupported file type. Use DOCX, PPTX, XLSX, TXT, Markdown, HTML, CSV, JSON, SRT, VTT, PNG, JPG or WebP.".to_string())),
+    let mut counts = Counts {
+        stage: "preparing".to_string(),
+        ..Counts::default()
     };
-    Ok(FileJobResult {
+    report(&counts, &progress);
+    let translated = match extension.as_str() {
+        "docx" => {
+            translate_office(
+                store,
+                scheduler,
+                &bytes,
+                &options,
+                output_mode,
+                OfficeKind::Word,
+                &mut counts,
+                &progress,
+            )
+            .await?
+        }
+        "pptx" => {
+            translate_office(
+                store,
+                scheduler,
+                &bytes,
+                &options,
+                output_mode,
+                OfficeKind::PowerPoint,
+                &mut counts,
+                &progress,
+            )
+            .await?
+        }
+        "xlsx" => {
+            translate_office(
+                store,
+                scheduler,
+                &bytes,
+                &options,
+                output_mode,
+                OfficeKind::Excel,
+                &mut counts,
+                &progress,
+            )
+            .await?
+        }
+        "json" => {
+            translate_json(
+                store,
+                scheduler,
+                &bytes,
+                &options,
+                output_mode,
+                &mut counts,
+                &progress,
+            )
+            .await?
+        }
+        "csv" => {
+            translate_csv(
+                store,
+                scheduler,
+                &bytes,
+                &options,
+                output_mode,
+                &mut counts,
+                &progress,
+            )
+            .await?
+        }
+        "srt" | "vtt" => {
+            translate_caption(
+                store,
+                scheduler,
+                &bytes,
+                &options,
+                output_mode,
+                &mut counts,
+                &progress,
+            )
+            .await?
+        }
+        "txt" | "md" | "markdown" | "html" | "htm" => {
+            translate_plain_file(
+                store,
+                scheduler,
+                &bytes,
+                &options,
+                output_mode,
+                &mut counts,
+                &progress,
+            )
+            .await?
+        }
+        "png" | "jpg" | "jpeg" | "webp" => {
+            translate_image_file(
+                store,
+                scheduler,
+                filename,
+                bytes,
+                &options,
+                &mut counts,
+                &progress,
+            )
+            .await?
+        }
+        _ => {
+            return Err(FileError::Message(
+                "Unsupported file type. Use DOCX, PPTX, XLSX, TXT, Markdown, HTML, CSV, JSON, SRT, VTT, PNG, JPG or WebP."
+                    .to_string(),
+            ))
+        }
+    };
+    counts.stage = "completed".to_string();
+    report(&counts, &progress);
+    Ok(FileTranslationResult {
         filename: translated_filename(filename),
         media_type: mime_guess::from_path(filename)
             .first_or_octet_stream()
             .to_string(),
-        content_base64: BASE64.encode(translated),
+        content: translated,
         translated_segments: counts.translated,
         skipped_segments: counts.skipped,
+        total_segments: counts.total_segments,
+        total_batches: counts.total_batches,
     })
 }
 
+fn report(counts: &Counts, progress: &ProgressCallback) {
+    progress(FileProgress {
+        stage: counts.stage.clone(),
+        total_segments: counts.total_segments,
+        translated_segments: counts.translated,
+        skipped_segments: counts.skipped,
+        total_batches: counts.total_batches,
+        completed_batches: counts.completed_batches,
+    });
+}
+
 async fn translate_image_file(
-    store: &AppStore,
+    _store: &AppStore,
+    scheduler: &AiScheduler,
     filename: &str,
     bytes: Vec<u8>,
     options: &TranslateRequest,
     counts: &mut Counts,
+    progress: &ProgressCallback,
 ) -> Result<Vec<u8>, FileError> {
-    let translated = ai::translate_image(store, options, filename, bytes)
+    counts.stage = "translating".to_string();
+    counts.total_segments += 1;
+    counts.total_batches += 1;
+    report(counts, progress);
+    let translated = scheduler
+        .translate_image(options.clone(), filename.to_string(), bytes, Priority::Low)
         .await
         .map_err(|error| FileError::Message(error.to_string()))?;
     counts.translated += 1;
+    counts.completed_batches += 1;
+    report(counts, progress);
     Ok(translated)
 }
 
 async fn translate_plain_file(
     store: &AppStore,
+    scheduler: &AiScheduler,
     bytes: &[u8],
     options: &TranslateRequest,
+    output_mode: FileOutputMode,
     counts: &mut Counts,
+    progress: &ProgressCallback,
 ) -> Result<Vec<u8>, FileError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| FileError::Message("Only UTF-8 text files are supported".to_string()))?;
-    Ok(
-        translate_lines(store, text, options, counts, |line| !line.trim().is_empty())
-            .await?
-            .into_bytes(),
+    Ok(translate_lines(
+        store,
+        scheduler,
+        text,
+        options,
+        output_mode,
+        counts,
+        progress,
+        |line| !line.trim().is_empty(),
     )
+    .await?
+    .into_bytes())
 }
 
 async fn translate_caption(
     store: &AppStore,
+    scheduler: &AiScheduler,
     bytes: &[u8],
     options: &TranslateRequest,
+    output_mode: FileOutputMode,
     counts: &mut Counts,
+    progress: &ProgressCallback,
 ) -> Result<Vec<u8>, FileError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| FileError::Message("Only UTF-8 caption files are supported".to_string()))?;
@@ -114,49 +274,83 @@ async fn translate_caption(
         !trimmed.is_empty()
             && !trimmed.starts_with("WEBVTT")
             && !trimmed.contains("-->")
-            && !trimmed.parse::<usize>().is_ok()
+            && trimmed.parse::<usize>().is_err()
     };
-    Ok(
-        translate_lines(store, text, options, counts, should_translate)
-            .await?
-            .into_bytes(),
+    Ok(translate_lines(
+        store,
+        scheduler,
+        text,
+        options,
+        output_mode,
+        counts,
+        progress,
+        should_translate,
     )
+    .await?
+    .into_bytes())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_lines<F>(
     store: &AppStore,
+    scheduler: &AiScheduler,
     text: &str,
     options: &TranslateRequest,
+    output_mode: FileOutputMode,
     counts: &mut Counts,
+    progress: &ProgressCallback,
     should_translate: F,
 ) -> Result<String, FileError>
 where
     F: Fn(&str) -> bool,
 {
-    let mut translated = String::with_capacity(text.len());
+    let mut lines = Vec::new();
+    let mut candidates = Vec::new();
     for chunk in text.split_inclusive('\n') {
         let (line, suffix) = match chunk.strip_suffix('\n') {
             Some(line) => (line, "\n"),
             None => (chunk, ""),
         };
-        if should_translate(line) {
-            translated.push_str(
-                &translate_preserving_surrounding_whitespace(store, line, options, counts).await?,
-            );
+        let translate = should_translate(line);
+        if translate {
+            candidates.push(line.to_string());
         } else {
             counts.skipped += 1;
-            translated.push_str(line);
         }
-        translated.push_str(suffix);
+        lines.push((line.to_string(), suffix.to_string(), translate));
+    }
+    let translations = translate_fragments(
+        store,
+        scheduler,
+        candidates,
+        options,
+        output_mode,
+        counts,
+        progress,
+    )
+    .await?;
+    let mut translated = String::with_capacity(text.len());
+    let mut candidate_index = 0;
+    for (line, suffix, should_translate) in lines {
+        if should_translate {
+            translated.push_str(&translations[candidate_index]);
+            candidate_index += 1;
+        } else {
+            translated.push_str(&line);
+        }
+        translated.push_str(&suffix);
     }
     Ok(translated)
 }
 
 async fn translate_csv(
     store: &AppStore,
+    scheduler: &AiScheduler,
     bytes: &[u8],
     options: &TranslateRequest,
+    output_mode: FileOutputMode,
     counts: &mut Counts,
+    progress: &ProgressCallback,
 ) -> Result<Vec<u8>, FileError> {
     let delimiter = if bytes.contains(&b'\t') && !bytes.contains(&b',') {
         b'\t'
@@ -168,21 +362,42 @@ async fn translate_csv(
         .flexible(true)
         .delimiter(delimiter)
         .from_reader(bytes);
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    let mut candidates = Vec::new();
+    for row in reader.records() {
+        let row = row?;
+        let values = row.iter().map(str::to_string).collect::<Vec<_>>();
+        for value in &values {
+            if value.trim().is_empty() {
+                counts.skipped += 1;
+            } else {
+                candidates.push(value.clone());
+            }
+        }
+        rows.push(values);
+    }
+    let translations = translate_fragments(
+        store,
+        scheduler,
+        candidates,
+        options,
+        output_mode,
+        counts,
+        progress,
+    )
+    .await?;
+    let mut translation_index = 0;
     let mut writer = csv::WriterBuilder::new()
         .delimiter(delimiter)
         .from_writer(Vec::new());
-    for row in reader.records() {
-        let row = row?;
-        let mut output = csv::StringRecord::new();
-        for value in &row {
-            if value.trim().is_empty() {
-                counts.skipped += 1;
-                output.push_field(value);
-            } else {
-                output.push_field(&translate_fragment(store, value, options, counts).await?);
+    for row in &mut rows {
+        for value in &mut *row {
+            if !value.trim().is_empty() {
+                *value = translations[translation_index].clone();
+                translation_index += 1;
             }
         }
-        writer.write_record(&output)?;
+        writer.write_record(row)?;
     }
     writer.flush()?;
     writer
@@ -192,88 +407,239 @@ async fn translate_csv(
 
 async fn translate_json(
     store: &AppStore,
+    scheduler: &AiScheduler,
     bytes: &[u8],
     options: &TranslateRequest,
+    output_mode: FileOutputMode,
     counts: &mut Counts,
+    progress: &ProgressCallback,
 ) -> Result<Vec<u8>, FileError> {
     let mut json: Value = serde_json::from_slice(bytes)?;
-    translate_json_value(store, &mut json, options, counts).await?;
+    let mut candidates = Vec::new();
+    collect_json_texts(&json, &mut candidates, &mut counts.skipped);
+    let translations = translate_fragments(
+        store,
+        scheduler,
+        candidates,
+        options,
+        output_mode,
+        counts,
+        progress,
+    )
+    .await?;
+    let mut translation_index = 0;
+    apply_json_texts(&mut json, &translations, &mut translation_index);
     Ok(serde_json::to_vec_pretty(&json)?)
 }
 
-async fn translate_json_value(
-    store: &AppStore,
-    value: &mut Value,
-    options: &TranslateRequest,
-    counts: &mut Counts,
-) -> Result<(), FileError> {
+fn collect_json_texts(value: &Value, texts: &mut Vec<String>, skipped: &mut usize) {
     match value {
-        Value::String(text) => {
-            if text.trim().is_empty() {
-                counts.skipped += 1;
-            } else {
-                *text = translate_fragment(store, text, options, counts).await?;
-            }
-        }
+        Value::String(text) if !text.trim().is_empty() => texts.push(text.clone()),
+        Value::String(_) | Value::Null | Value::Bool(_) | Value::Number(_) => *skipped += 1,
         Value::Array(items) => {
             for item in items {
-                Box::pin(translate_json_value(store, item, options, counts)).await?;
+                collect_json_texts(item, texts, skipped);
             }
         }
         Value::Object(entries) => {
-            for value in entries.values_mut() {
-                Box::pin(translate_json_value(store, value, options, counts)).await?;
+            for item in entries.values() {
+                collect_json_texts(item, texts, skipped);
             }
         }
-        _ => counts.skipped += 1,
     }
-    Ok(())
 }
 
-async fn translate_preserving_surrounding_whitespace(
-    store: &AppStore,
-    line: &str,
-    options: &TranslateRequest,
-    counts: &mut Counts,
-) -> Result<String, FileError> {
-    let leading = line.len() - line.trim_start().len();
-    let trailing = line.len() - line.trim_end().len();
-    let text = line.trim();
-    let translated = translate_fragment(store, text, options, counts).await?;
-    Ok(format!(
-        "{}{}{}",
-        &line[..leading],
-        translated,
-        &line[line.len() - trailing..]
-    ))
+fn apply_json_texts(value: &mut Value, translations: &[String], translation_index: &mut usize) {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => {
+            *text = translations[*translation_index].clone();
+            *translation_index += 1;
+        }
+        Value::Array(items) => {
+            for item in items {
+                apply_json_texts(item, translations, translation_index);
+            }
+        }
+        Value::Object(entries) => {
+            for item in entries.values_mut() {
+                apply_json_texts(item, translations, translation_index);
+            }
+        }
+        _ => {}
+    }
 }
 
-async fn translate_fragment(
+struct PlannedFragment {
+    source: String,
+    parts: Vec<FragmentPart>,
+}
+
+struct FragmentPart {
+    result_index: usize,
+    leading: String,
+    trailing: String,
+}
+
+struct PendingPart {
+    result_index: usize,
+    text: String,
+}
+
+async fn translate_fragments(
     store: &AppStore,
-    text: &str,
+    scheduler: &AiScheduler,
+    fragments: Vec<String>,
     options: &TranslateRequest,
+    output_mode: FileOutputMode,
     counts: &mut Counts,
-) -> Result<String, FileError> {
-    let max_chars = store.settings().max_chunk_chars;
-    let chunks = split_chunks(text, max_chars);
-    let mut result = String::new();
-    for chunk in chunks {
-        let (leading, content, trailing) = surrounding_whitespace(&chunk);
+    progress: &ProgressCallback,
+) -> Result<Vec<String>, FileError> {
+    let maximum = store.settings().max_chunk_chars.max(1);
+    let mut planned = Vec::with_capacity(fragments.len());
+    let mut pending = Vec::new();
+    for source in fragments {
+        let (_, content, _) = surrounding_whitespace(&source);
         if content.is_empty() {
-            result.push_str(&chunk);
+            counts.skipped += 1;
+            planned.push(PlannedFragment {
+                source,
+                parts: Vec::new(),
+            });
             continue;
         }
-        let mut request = options.clone();
-        request.text = content.to_string();
-        let response = ai::translate(store, &request)
-            .await
-            .map_err(|error| FileError::Message(error.to_string()))?;
-        counts.translated += 1;
-        result.push_str(leading);
-        result.push_str(&response.translated_text);
-        result.push_str(trailing);
+        let mut parts = Vec::new();
+        for chunk in split_chunks(content, maximum) {
+            let (leading, text, trailing) = surrounding_whitespace(&chunk);
+            if text.is_empty() {
+                continue;
+            }
+            let result_index = pending.len();
+            pending.push(PendingPart {
+                result_index,
+                text: text.to_string(),
+            });
+            parts.push(FragmentPart {
+                result_index,
+                leading: leading.to_string(),
+                trailing: trailing.to_string(),
+            });
+        }
+        planned.push(PlannedFragment { source, parts });
     }
-    Ok(result)
+
+    if pending.is_empty() {
+        report(counts, progress);
+        return Ok(planned
+            .into_iter()
+            .map(|fragment| fragment.source)
+            .collect());
+    }
+
+    let mut batches: Vec<Vec<PendingPart>> = Vec::new();
+    let mut current = Vec::new();
+    let mut current_chars = 0usize;
+    for part in pending {
+        let part_chars = part.text.chars().count();
+        if !current.is_empty() && current_chars + part_chars > maximum {
+            batches.push(current);
+            current = Vec::new();
+            current_chars = 0;
+        }
+        current_chars += part_chars;
+        current.push(part);
+    }
+    if !current.is_empty() {
+        batches.push(current);
+    }
+    counts.stage = "translating".to_string();
+    counts.total_segments += planned
+        .iter()
+        .map(|fragment| fragment.parts.len())
+        .sum::<usize>();
+    counts.total_batches += batches.len();
+    report(counts, progress);
+
+    let mut results = vec![String::new(); counts.total_segments];
+    let mut jobs = JoinSet::new();
+    for batch in batches {
+        let scheduler = scheduler.clone();
+        let options = options.clone();
+        jobs.spawn(async move {
+            let indexes = batch
+                .iter()
+                .map(|part| part.result_index)
+                .collect::<Vec<_>>();
+            let texts = batch
+                .iter()
+                .map(|part| part.text.clone())
+                .collect::<Vec<_>>();
+            let translations = scheduler
+                .translate_batch(options, texts, Priority::Low)
+                .await
+                .map_err(|error| FileError::Message(error.to_string()))?;
+            if translations.len() != indexes.len() {
+                return Err(FileError::Message(
+                    "AI returned a different number of translations than requested".to_string(),
+                ));
+            }
+            Ok::<_, FileError>((indexes, translations))
+        });
+    }
+    while let Some(result) = jobs.join_next().await {
+        let (indexes, translations) = result.map_err(|error| {
+            FileError::Message(format!("Translation batch task failed: {error}"))
+        })??;
+        for (index, translation) in indexes.into_iter().zip(translations) {
+            results[index] = translation;
+            counts.translated += 1;
+        }
+        counts.completed_batches += 1;
+        report(counts, progress);
+    }
+
+    let mut output = Vec::with_capacity(planned.len());
+    for fragment in planned {
+        if fragment.parts.is_empty() {
+            output.push(fragment.source);
+            continue;
+        }
+        let translated = fragment
+            .parts
+            .iter()
+            .map(|part| {
+                format!(
+                    "{}{}{}",
+                    part.leading, results[part.result_index], part.trailing
+                )
+            })
+            .collect::<String>();
+        output.push(render_fragment(&fragment.source, &translated, output_mode));
+    }
+    Ok(output)
+}
+
+fn render_fragment(source: &str, translated: &str, output_mode: FileOutputMode) -> String {
+    if output_mode == FileOutputMode::Translated {
+        return restore_surrounding_whitespace(source, translated);
+    }
+    let (leading, content, trailing) = surrounding_whitespace(source);
+    if content.is_empty() {
+        source.to_string()
+    } else {
+        format!(
+            "{}{}\n{}{}{}",
+            leading,
+            content,
+            leading,
+            translated.trim(),
+            trailing
+        )
+    }
+}
+
+fn restore_surrounding_whitespace(source: &str, translated: &str) -> String {
+    let (leading, _, trailing) = surrounding_whitespace(source);
+    format!("{}{}{}", leading, translated, trailing)
 }
 
 fn surrounding_whitespace(value: &str) -> (&str, &str, &str) {
@@ -330,14 +696,17 @@ enum OfficeKind {
     Excel,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_office(
     store: &AppStore,
+    scheduler: &AiScheduler,
     bytes: &[u8],
     options: &TranslateRequest,
+    output_mode: FileOutputMode,
     kind: OfficeKind,
     counts: &mut Counts,
+    progress: &ProgressCallback,
 ) -> Result<Vec<u8>, FileError> {
-    // ZipArchive and ZipFile are not Send; fully unpack before awaiting AI responses.
     let entries = unpack_office(bytes)?;
     let mut translated_entries = Vec::with_capacity(entries.len());
     for (name, is_directory, contents) in entries {
@@ -347,19 +716,64 @@ async fn translate_office(
         }
         let translated = match kind {
             OfficeKind::Word if name.starts_with("word/") && name.ends_with(".xml") => {
-                translate_xml_document(store, &contents, options, b"w:p", b"w:t", counts).await?
+                translate_xml_document(
+                    store,
+                    scheduler,
+                    &contents,
+                    options,
+                    output_mode,
+                    b"w:p",
+                    b"w:t",
+                    counts,
+                    progress,
+                )
+                .await?
             }
             OfficeKind::PowerPoint if name.starts_with("ppt/slides/") && name.ends_with(".xml") => {
-                translate_xml_document(store, &contents, options, b"a:p", b"a:t", counts).await?
+                translate_xml_document(
+                    store,
+                    scheduler,
+                    &contents,
+                    options,
+                    output_mode,
+                    b"a:p",
+                    b"a:t",
+                    counts,
+                    progress,
+                )
+                .await?
             }
             OfficeKind::Excel if name == "xl/sharedStrings.xml" => {
-                translate_xml_document(store, &contents, options, b"si", b"t", counts).await?
+                translate_xml_document(
+                    store,
+                    scheduler,
+                    &contents,
+                    options,
+                    output_mode,
+                    b"si",
+                    b"t",
+                    counts,
+                    progress,
+                )
+                .await?
             }
             OfficeKind::Excel if name.starts_with("xl/worksheets/") && name.ends_with(".xml") => {
-                translate_xml_document(store, &contents, options, b"is", b"t", counts).await?
+                translate_xml_document(
+                    store,
+                    scheduler,
+                    &contents,
+                    options,
+                    output_mode,
+                    b"is",
+                    b"t",
+                    counts,
+                    progress,
+                )
+                .await?
             }
             _ if is_office_image(kind, &name) && provider_supports_images(store, options) => {
-                translate_image_file(store, &name, contents, options, counts).await?
+                translate_image_file(store, scheduler, &name, contents, options, counts, progress)
+                    .await?
             }
             _ => {
                 if is_office_image(kind, &name) {
@@ -371,6 +785,8 @@ async fn translate_office(
         translated_entries.push((name, false, translated));
     }
 
+    counts.stage = "packing".to_string();
+    report(counts, progress);
     let mut output = ZipWriter::new(Cursor::new(Vec::new()));
     let file_options = FileOptions::default().compression_method(CompressionMethod::Deflated);
     for (name, is_directory, contents) in translated_entries {
@@ -416,21 +832,24 @@ fn unpack_office(bytes: &[u8]) -> Result<Vec<(String, bool, Vec<u8>)>, FileError
     Ok(entries)
 }
 
-async fn translate_xml_document(
-    store: &AppStore,
+struct XmlBlock {
+    start: usize,
+    end: usize,
+    original: Vec<u8>,
+    text: String,
+}
+
+fn extract_xml_blocks(
     bytes: &[u8],
-    options: &TranslateRequest,
     block_tag: &[u8],
     text_tag: &[u8],
-    counts: &mut Counts,
-) -> Result<Vec<u8>, FileError> {
+) -> Result<Vec<XmlBlock>, FileError> {
     let mut reader = Reader::from_reader(bytes);
     reader.config_mut().trim_text(false);
     let mut buffer = Vec::new();
-    let mut last_copy = 0;
     let mut block_start: Option<usize> = None;
     let mut depth = 0usize;
-    let mut output = Vec::with_capacity(bytes.len());
+    let mut blocks = Vec::new();
     loop {
         let before = usize::try_from(reader.buffer_position())
             .map_err(|_| FileError::Message("Document XML exceeds supported size".to_string()))?;
@@ -452,27 +871,61 @@ async fn translate_xml_document(
                         FileError::Message("Document XML exceeds supported size".to_string())
                     })?;
                     let start = block_start.take().expect("block exists when depth is zero");
-                    output.extend_from_slice(&bytes[last_copy..start]);
-                    let original = &bytes[start..end_position];
-                    let text = xml_text(original, text_tag)?;
-                    if text.trim().is_empty() {
-                        counts.skipped += 1;
-                        output.extend_from_slice(original);
-                    } else {
-                        let translated = translate_fragment(store, &text, options, counts).await?;
-                        output.extend_from_slice(&replace_xml_text(
-                            original,
-                            text_tag,
-                            &translated,
-                        )?);
-                    }
-                    last_copy = end_position;
+                    let original = bytes[start..end_position].to_vec();
+                    let text = xml_text(&original, text_tag)?;
+                    blocks.push(XmlBlock {
+                        start,
+                        end: end_position,
+                        original,
+                        text,
+                    });
                 }
             }
             Event::Eof => break,
             _ => {}
         }
         buffer.clear();
+    }
+    Ok(blocks)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn translate_xml_document(
+    store: &AppStore,
+    scheduler: &AiScheduler,
+    bytes: &[u8],
+    options: &TranslateRequest,
+    output_mode: FileOutputMode,
+    block_tag: &[u8],
+    text_tag: &[u8],
+    counts: &mut Counts,
+    progress: &ProgressCallback,
+) -> Result<Vec<u8>, FileError> {
+    let blocks = extract_xml_blocks(bytes, block_tag, text_tag)?;
+    let sources = blocks
+        .iter()
+        .map(|block| block.text.clone())
+        .collect::<Vec<_>>();
+    let translations = translate_fragments(
+        store,
+        scheduler,
+        sources,
+        options,
+        output_mode,
+        counts,
+        progress,
+    )
+    .await?;
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut last_copy = 0;
+    for (block, translated) in blocks.iter().zip(translations) {
+        output.extend_from_slice(&bytes[last_copy..block.start]);
+        if block.text.trim().is_empty() {
+            output.extend_from_slice(&block.original);
+        } else {
+            output.extend_from_slice(&replace_xml_text(&block.original, text_tag, &translated)?);
+        }
+        last_copy = block.end;
     }
     output.extend_from_slice(&bytes[last_copy..]);
     Ok(output)
@@ -547,7 +1000,8 @@ fn translated_filename(filename: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{replace_xml_text, split_chunks, surrounding_whitespace, xml_text};
+    use super::{render_fragment, replace_xml_text, split_chunks, surrounding_whitespace};
+    use crate::models::FileOutputMode;
 
     #[test]
     fn splitting_preserves_all_content() {
@@ -560,10 +1014,13 @@ mod tests {
     #[test]
     fn office_text_is_extracted_and_replaced_without_losing_runs() {
         let paragraph = br#"<w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Hello </w:t></w:r><w:r><w:t>world &amp; team</w:t></w:r></w:p>"#;
-        assert_eq!(xml_text(paragraph, b"w:t").unwrap(), "Hello world & team");
+        assert_eq!(
+            super::xml_text(paragraph, b"w:t").unwrap(),
+            "Hello world & team"
+        );
 
         let translated = replace_xml_text(paragraph, b"w:t", "你好，团队").unwrap();
-        let translated_text = xml_text(&translated, b"w:t").unwrap();
+        let translated_text = super::xml_text(&translated, b"w:t").unwrap();
         assert_eq!(translated_text, "你好，团队");
         assert!(String::from_utf8(translated).unwrap().contains("<w:b"));
     }
@@ -575,5 +1032,17 @@ mod tests {
             ("  ", "translate me", " \n")
         );
         assert_eq!(surrounding_whitespace("   "), ("   ", "", ""));
+    }
+
+    #[test]
+    fn bilingual_output_keeps_source_and_translation_whitespace() {
+        assert_eq!(
+            render_fragment("  hello ", "你好", FileOutputMode::Bilingual),
+            "  hello\n  你好 "
+        );
+        assert_eq!(
+            render_fragment("  hello ", "你好", FileOutputMode::Translated),
+            "  你好 "
+        );
     }
 }

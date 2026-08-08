@@ -1,8 +1,8 @@
-use std::{io, path::PathBuf};
+use std::{io, path::PathBuf, sync::Arc};
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
-    http::{HeaderValue, Method, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Json, Router,
@@ -17,10 +17,12 @@ use tower_http::{
 
 use crate::{
     ai, files,
+    jobs::FileJobManager,
     models::{
-        AppData, AppSettings, FileJobResult, Glossary, HistoryEntry, PromptTemplate, Provider,
+        AppData, AppSettings, FileJobStatus, Glossary, HistoryEntry, PromptTemplate, Provider,
         TranslateOptions, TranslateRequest, TranslationResult,
     },
+    scheduler::{AiScheduler, Priority},
     store::AppStore,
 };
 
@@ -30,9 +32,18 @@ pub struct ServerState {
     pub server_url: String,
 }
 
+#[derive(Clone)]
+struct ApiState {
+    store: AppStore,
+    server_url: String,
+    scheduler: AiScheduler,
+    jobs: FileJobManager,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BootstrapResponse {
+    version: String,
     providers: Vec<Provider>,
     glossaries: Vec<Glossary>,
     prompts: Vec<PromptTemplate>,
@@ -67,11 +78,21 @@ fn api_router(state: ServerState) -> Router {
         HeaderValue::from_static("https://tauri.localhost"),
         HeaderValue::from_static("tauri://localhost"),
     ];
+    let store = state.store.clone();
+    let api_state = ApiState {
+        store: store.clone(),
+        server_url: state.server_url,
+        scheduler: AiScheduler::new(store),
+        jobs: FileJobManager::new(),
+    };
     Router::new()
         .route("/api/health", get(health))
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/translate", post(translate))
         .route("/api/translate-file", post(translate_file))
+        .route("/api/file-jobs", get(file_jobs))
+        .route("/api/file-jobs/{id}", get(file_job))
+        .route("/api/file-jobs/{id}/download", get(download_file_job))
         .route("/api/history", get(history).delete(clear_history))
         .route("/api/history/{id}", delete(delete_history))
         .route("/api/providers", put(save_provider))
@@ -91,7 +112,7 @@ fn api_router(state: ServerState) -> Router {
                 .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
                 .allow_headers(Any),
         )
-        .with_state(state)
+        .with_state(api_state)
 }
 
 async fn health() -> Json<MessageResponse> {
@@ -100,7 +121,7 @@ async fn health() -> Json<MessageResponse> {
     })
 }
 
-async fn bootstrap(State(state): State<ServerState>) -> Json<BootstrapResponse> {
+async fn bootstrap(State(state): State<ApiState>) -> Json<BootstrapResponse> {
     let AppData {
         providers,
         glossaries,
@@ -109,6 +130,7 @@ async fn bootstrap(State(state): State<ServerState>) -> Json<BootstrapResponse> 
         history,
     } = state.store.snapshot();
     Json(BootstrapResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
         providers,
         glossaries,
         prompts,
@@ -119,10 +141,12 @@ async fn bootstrap(State(state): State<ServerState>) -> Json<BootstrapResponse> 
 }
 
 async fn translate(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Json(request): Json<TranslateRequest>,
 ) -> Result<Json<TranslationResult>, ApiError> {
-    let result = ai::translate(&state.store, &request)
+    let result = state
+        .scheduler
+        .translate(request.clone(), Priority::High)
         .await
         .map_err(ApiError::from_ai)?;
     state
@@ -133,9 +157,9 @@ async fn translate(
 }
 
 async fn translate_file(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     mut multipart: Multipart,
-) -> Result<Json<FileJobResult>, ApiError> {
+) -> Result<Json<FileJobStatus>, ApiError> {
     let mut file: Option<(String, Vec<u8>)> = None;
     let mut options: Option<TranslateOptions> = None;
     while let Some(field) = multipart
@@ -165,31 +189,131 @@ async fn translate_file(
     let (filename, bytes) = file.ok_or_else(|| ApiError::bad_request("A file is required"))?;
     let options =
         options.ok_or_else(|| ApiError::bad_request("Translation options are required"))?;
+    let output_mode = options.output_mode;
     let request = options.into_request();
-    let result = files::translate_file(&state.store, &filename, bytes, request.clone())
+    let status = state.jobs.create(&filename, output_mode);
+    let job_id = status.id.clone();
+    let jobs = state.jobs.clone();
+    let store = state.store.clone();
+    let scheduler = state.scheduler.clone();
+    tokio::spawn(async move {
+        jobs.mark_processing(&job_id);
+        let progress_jobs = jobs.clone();
+        let progress_job_id = job_id.clone();
+        let progress: files::ProgressCallback = Arc::new(move |value| {
+            progress_jobs.update_progress(&progress_job_id, value);
+        });
+        match files::translate_file(
+            &store,
+            &scheduler,
+            &filename,
+            bytes,
+            request.clone(),
+            output_mode,
+            progress,
+        )
         .await
-        .map_err(ApiError::from_file)?;
+        {
+            Ok(result) => {
+                let history_result = history_for_file(&request, &result.filename);
+                if let Err(error) = store.add_history(history_result) {
+                    jobs.fail(&job_id, error.to_string());
+                } else {
+                    jobs.complete(&job_id, result);
+                }
+            }
+            Err(error) => jobs.fail(&job_id, error.to_string()),
+        }
+    });
+    Ok(Json(status))
+}
+
+async fn file_jobs(State(state): State<ApiState>) -> Json<Vec<FileJobStatus>> {
+    Json(state.jobs.list())
+}
+
+async fn file_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<FileJobStatus>, ApiError> {
     state
-        .store
-        .add_history(history_for_file(&request, &result))
-        .map_err(ApiError::from_io)?;
-    Ok(Json(result))
+        .jobs
+        .get(&id)
+        .map(Json)
+        .ok_or_else(|| ApiError::not_found("File job was not found"))
+}
+
+async fn download_file_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let (filename, media_type, content) = state
+        .jobs
+        .download(&id)
+        .ok_or_else(|| ApiError::bad_request("File translation is not complete"))?;
+    let mut response = content.into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_str(&media_type).map_err(ApiError::internal)?,
+    );
+    response.headers_mut().insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_str(&content_disposition(&filename)).map_err(ApiError::internal)?,
+    );
+    Ok(response)
+}
+
+fn content_disposition(filename: &str) -> String {
+    let fallback = filename
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!(
+        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
+        if fallback.is_empty() {
+            "translation"
+        } else {
+            &fallback
+        },
+        percent_encode(filename.as_bytes())
+    )
+}
+
+fn percent_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(bytes.len());
+    for byte in bytes {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b'~') {
+            encoded.push(*byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+    }
+    encoded
 }
 
 async fn delete_history(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state.store.delete_history(&id).map_err(ApiError::from_io)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn clear_history(State(state): State<ServerState>) -> Result<StatusCode, ApiError> {
+async fn clear_history(State(state): State<ApiState>) -> Result<StatusCode, ApiError> {
     state.store.clear_history().map_err(ApiError::from_io)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn history(State(state): State<ServerState>) -> Json<Vec<HistoryEntry>> {
+async fn history(State(state): State<ApiState>) -> Json<Vec<HistoryEntry>> {
     Json(state.store.snapshot().history)
 }
 
@@ -217,7 +341,7 @@ fn history_for_text(request: &TranslateRequest, result: &TranslationResult) -> H
     }
 }
 
-fn history_for_file(request: &TranslateRequest, result: &FileJobResult) -> HistoryEntry {
+fn history_for_file(request: &TranslateRequest, filename: &str) -> HistoryEntry {
     HistoryEntry {
         id: history_id(),
         kind: "file".to_string(),
@@ -225,7 +349,7 @@ fn history_for_file(request: &TranslateRequest, result: &FileJobResult) -> Histo
         target_language: request.target_language.clone(),
         source_text: String::new(),
         translated_text: String::new(),
-        filename: Some(result.filename.clone()),
+        filename: Some(filename.to_string()),
         provider: request.provider_id.clone(),
         model: String::new(),
         created_at: unix_timestamp(),
@@ -242,7 +366,7 @@ fn unix_timestamp() -> String {
 }
 
 async fn save_provider(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Json(provider): Json<Provider>,
 ) -> Result<Json<Provider>, ApiError> {
     Ok(Json(
@@ -254,7 +378,7 @@ async fn save_provider(
 }
 
 async fn delete_provider(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state
@@ -265,18 +389,36 @@ async fn delete_provider(
 }
 
 async fn test_provider(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<MessageResponse>, ApiError> {
+    let provider = state
+        .store
+        .snapshot()
+        .providers
+        .into_iter()
+        .find(|provider| provider.id == id)
+        .ok_or_else(|| ApiError::bad_request("Provider was not found"))?;
+    let request = TranslateRequest {
+        text: "Reply with OK only.".to_string(),
+        source_language: "English".to_string(),
+        target_language: "English".to_string(),
+        provider_id: id,
+        prompt_id: None,
+        glossary_ids: Vec::new(),
+    };
+    state
+        .scheduler
+        .translate(request, Priority::High)
+        .await
+        .map_err(ApiError::from_ai)?;
     Ok(Json(MessageResponse {
-        message: ai::test_provider(&state.store, &id)
-            .await
-            .map_err(ApiError::from_ai)?,
+        message: format!("{} responded successfully", provider.name),
     }))
 }
 
 async fn save_glossary(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Json(glossary): Json<Glossary>,
 ) -> Result<Json<Glossary>, ApiError> {
     Ok(Json(
@@ -288,7 +430,7 @@ async fn save_glossary(
 }
 
 async fn delete_glossary(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state
@@ -299,7 +441,7 @@ async fn delete_glossary(
 }
 
 async fn save_prompt(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Json(prompt): Json<PromptTemplate>,
 ) -> Result<Json<PromptTemplate>, ApiError> {
     Ok(Json(
@@ -308,7 +450,7 @@ async fn save_prompt(
 }
 
 async fn delete_prompt(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     state.store.delete_prompt(&id).map_err(ApiError::from_io)?;
@@ -316,7 +458,7 @@ async fn delete_prompt(
 }
 
 async fn save_settings(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Json(settings): Json<AppSettings>,
 ) -> Result<Json<AppSettings>, ApiError> {
     Ok(Json(
@@ -328,7 +470,7 @@ async fn save_settings(
 }
 
 async fn import_data(
-    State(state): State<ServerState>,
+    State(state): State<ApiState>,
     Path(kind): Path<String>,
     Json(body): Json<Value>,
 ) -> Result<Json<BootstrapResponse>, ApiError> {
@@ -351,6 +493,7 @@ async fn import_data(
         history,
     } = state.store.snapshot();
     Ok(Json(BootstrapResponse {
+        version: env!("CARGO_PKG_VERSION").to_string(),
         providers,
         glossaries,
         prompts,
@@ -390,6 +533,18 @@ impl ApiError {
             message: error.to_string(),
         }
     }
+    fn not_found(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            message: error.to_string(),
+        }
+    }
+    fn internal(error: impl std::fmt::Display) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        }
+    }
     fn from_io(error: std::io::Error) -> Self {
         let status = if error.kind() == std::io::ErrorKind::InvalidInput {
             StatusCode::BAD_REQUEST
@@ -404,12 +559,6 @@ impl ApiError {
     fn from_ai(error: ai::AiError) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
-            message: error.to_string(),
-        }
-    }
-    fn from_file(error: files::FileError) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
             message: error.to_string(),
         }
     }

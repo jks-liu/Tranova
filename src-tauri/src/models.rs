@@ -74,6 +74,10 @@ pub struct AppSettings {
     pub web_port: u16,
     #[serde(default = "default_chunk_chars")]
     pub max_chunk_chars: usize,
+    #[serde(default = "default_concurrent_ai")]
+    pub max_concurrent_ai: usize,
+    #[serde(default = "default_ai_timeout_seconds")]
+    pub ai_timeout_seconds: u64,
 }
 
 fn default_language() -> String {
@@ -88,6 +92,12 @@ fn default_web_port() -> u16 {
 fn default_chunk_chars() -> usize {
     6000
 }
+fn default_concurrent_ai() -> usize {
+    3
+}
+fn default_ai_timeout_seconds() -> u64 {
+    180
+}
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -97,6 +107,8 @@ impl Default for AppSettings {
             web_host: default_web_host(),
             web_port: default_web_port(),
             max_chunk_chars: default_chunk_chars(),
+            max_concurrent_ai: default_concurrent_ai(),
+            ai_timeout_seconds: default_ai_timeout_seconds(),
         }
     }
 }
@@ -167,6 +179,16 @@ pub struct TranslateOptions {
     pub prompt_id: Option<String>,
     #[serde(default)]
     pub glossary_ids: Vec<String>,
+    #[serde(default)]
+    pub output_mode: FileOutputMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FileOutputMode {
+    #[default]
+    Translated,
+    Bilingual,
 }
 
 impl TranslateOptions {
@@ -184,7 +206,17 @@ impl TranslateOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::TranslateOptions;
+    use super::{AppSettings, TranslateOptions};
+
+    #[test]
+    fn settings_default_timeout_is_180_seconds() {
+        assert_eq!(AppSettings::default().ai_timeout_seconds, 180);
+        let settings: AppSettings = serde_json::from_str(
+            r#"{"language":"en","proxyUrl":"","webHost":"127.0.0.1","webPort":48731,"maxChunkChars":6000,"maxConcurrentAi":3}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.ai_timeout_seconds, 180);
+    }
 
     #[test]
     fn file_translation_options_do_not_require_text() {
@@ -219,12 +251,40 @@ pub struct TranslationResult {
     pub model: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FileJobResult {
-    pub filename: String,
-    pub media_type: String,
-    pub content_base64: String,
+#[derive(Debug, Clone)]
+pub struct FileProgress {
+    pub stage: String,
+    pub total_segments: usize,
     pub translated_segments: usize,
     pub skipped_segments: usize,
+    pub total_batches: usize,
+    pub completed_batches: usize,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileJobState {
+    Queued,
+    Processing,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileJobStatus {
+    pub id: String,
+    pub filename: String,
+    pub output_mode: FileOutputMode,
+    pub state: FileJobState,
+    pub stage: String,
+    pub total_segments: usize,
+    pub translated_segments: usize,
+    pub skipped_segments: usize,
+    pub total_batches: usize,
+    pub completed_batches: usize,
+    pub result_filename: String,
+    pub media_type: String,
+    pub error: Option<String>,
+    pub created_at: String,
 }

@@ -8,7 +8,7 @@ import type { BootstrapData } from "../types";
 export function TranslatePage({ data, onReload }: { data: BootstrapData; onReload: () => Promise<void> }) {
   const { t } = useTranslation();
   const defaultProvider = useMemo(() => data.providers.find((provider) => provider.enabled)?.id || "", [data.providers]);
-  const [options, setOptions] = useState<TranslationOptionsValue>({ sourceLanguage: "auto", targetLanguage: "zh", providerId: defaultProvider, promptId: data.prompts[0]?.id || "", glossaryIds: [] });
+  const [options, setOptions] = useState<TranslationOptionsValue>(() => readOptions(defaultProvider, data.prompts[0]?.id || ""));
   const [source, setSource] = useState("");
   const [result, setResult] = useState("");
   const [working, setWorking] = useState(false);
@@ -16,8 +16,21 @@ export function TranslatePage({ data, onReload }: { data: BootstrapData; onReloa
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    if (!options.providerId && defaultProvider) setOptions((current) => ({ ...current, providerId: defaultProvider }));
-  }, [defaultProvider, options.providerId]);
+    setOptions((current) => {
+      const providerExists = data.providers.some((provider) => provider.enabled && provider.id === current.providerId);
+      const promptExists = !current.promptId || data.prompts.some((prompt) => prompt.id === current.promptId);
+      const next = {
+        ...current,
+        providerId: providerExists ? current.providerId : defaultProvider,
+        promptId: promptExists ? current.promptId : data.prompts[0]?.id || "",
+      };
+      return JSON.stringify(next) === JSON.stringify(current) ? current : next;
+    });
+  }, [data.providers, data.prompts, defaultProvider]);
+
+  useEffect(() => {
+    localStorage.setItem("tranova-translate-options", JSON.stringify(options));
+  }, [options]);
 
   const translate = async () => {
     if (!source.trim() || !options.providerId) return;
@@ -40,12 +53,17 @@ export function TranslatePage({ data, onReload }: { data: BootstrapData; onReloa
     window.setTimeout(() => setCopied(false), 1500);
   };
 
+  const changeOptions = (next: TranslationOptionsValue) => {
+    setOptions(next);
+    localStorage.setItem("tranova-translate-options", JSON.stringify(next));
+  };
+
   return (
     <section className="page translate-page">
       <div className="page-heading">
         <div><h1>{t("translate.title")}</h1><p>{t("translate.subtitle")}</p></div>
       </div>
-      <TranslationOptions value={options} onChange={setOptions} providers={data.providers} prompts={data.prompts} glossaries={data.glossaries} />
+      <TranslationOptions value={options} onChange={changeOptions} providers={data.providers} prompts={data.prompts} glossaries={data.glossaries} />
       <div className="editor-grid">
         <section className="editor-panel">
           <header><strong>{t("translate.source")}</strong><span>{t("translate.characters", { count: source.length })}</span></header>
@@ -69,4 +87,25 @@ export function TranslatePage({ data, onReload }: { data: BootstrapData; onReloa
       </div>
     </section>
   );
+}
+
+function readOptions(defaultProvider: string, defaultPrompt: string): TranslationOptionsValue {
+  const fallback: TranslationOptionsValue = {
+    sourceLanguage: "auto",
+    targetLanguage: "zh",
+    providerId: defaultProvider,
+    promptId: defaultPrompt,
+    glossaryIds: [],
+  };
+  try {
+    const stored = JSON.parse(localStorage.getItem("tranova-translate-options") || "null") as Partial<TranslationOptionsValue> | null;
+    if (!stored || typeof stored !== "object") return fallback;
+    return {
+      ...fallback,
+      ...stored,
+      glossaryIds: Array.isArray(stored.glossaryIds) ? stored.glossaryIds : [],
+    };
+  } catch {
+    return fallback;
+  }
 }

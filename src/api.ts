@@ -1,12 +1,13 @@
 import type {
   AppSettings,
   BootstrapData,
-  FileJobResult,
+  FileJobStatus,
   Glossary,
   HistoryEntry,
   PromptTemplate,
   Provider,
   TranslateRequest,
+  TranslateFileOptions,
   TranslationResult,
 } from "./types";
 
@@ -35,17 +36,29 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+async function requestBlob(path: string): Promise<Blob> {
+  const response = await fetch(`${apiBase}/api${path}`);
+  if (!response.ok) {
+    const body = await response.json().catch(() => null) as { error?: string } | null;
+    throw new Error(body?.error || `${response.status} ${response.statusText}`);
+  }
+  return response.blob();
+}
+
 export const api = {
   bootstrap: () => request<BootstrapData>("/bootstrap"),
   history: () => request<HistoryEntry[]>("/history"),
   translate: (payload: TranslateRequest) =>
     request<TranslationResult>("/translate", { method: "POST", body: JSON.stringify(payload) }),
-  translateFile: async (file: File, options: Omit<TranslateRequest, "text">) => {
+  translateFile: async (file: File, options: TranslateFileOptions) => {
     const form = new FormData();
     form.append("file", file);
     form.append("options", JSON.stringify(options));
-    return request<FileJobResult>("/translate-file", { method: "POST", body: form });
+    return request<FileJobStatus>("/translate-file", { method: "POST", body: form });
   },
+  fileJobs: () => request<FileJobStatus[]>("/file-jobs"),
+  fileJob: (id: string) => request<FileJobStatus>(`/file-jobs/${encodeURIComponent(id)}`),
+  downloadFileJob: (id: string) => requestBlob(`/file-jobs/${encodeURIComponent(id)}/download`),
   saveProvider: (provider: Provider) =>
     request<Provider>("/providers", { method: "PUT", body: JSON.stringify(provider) }),
   deleteProvider: (id: string) => request<void>(`/providers/${id}`, { method: "DELETE" }),

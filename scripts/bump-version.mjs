@@ -15,8 +15,12 @@ const files = {
 const argumentsList = process.argv.slice(2);
 const buildRequested = argumentsList.includes("--build");
 const noBuildRequested = argumentsList.includes("--no-build");
+const currentRequested = argumentsList.includes("current");
+if (argumentsList.includes("--current")) throw new Error("Use current without dashes to display the current version");
 if (buildRequested && noBuildRequested) throw new Error("Use either --build or --no-build, not both");
+if (currentRequested && (buildRequested || noBuildRequested)) throw new Error("current cannot be combined with --build or --no-build");
 const versionArguments = argumentsList.filter((value) => !value.startsWith("--"));
+if (currentRequested && versionArguments.some((value) => value !== "current")) throw new Error("Current version mode cannot be combined with a bump version");
 if (versionArguments.length > 1) throw new Error("Only one version or release level can be provided");
 const argument = versionArguments[0] || "patch";
 const semverPattern = /^(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$/;
@@ -71,6 +75,10 @@ const packageData = JSON.parse(packageText);
 const packageLockData = JSON.parse(packageLockText);
 const tauriConfigData = JSON.parse(tauriConfigText);
 const current = packageData.version;
+if (currentRequested) {
+  console.log(current);
+  process.exit(0);
+}
 const versions = [
   ["package-lock.json", packageLockData.version],
   ["package-lock.json packages root", packageLockData.packages?.["" ]?.version],

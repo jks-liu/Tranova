@@ -1,38 +1,58 @@
-import { Download, FileText, UploadCloud } from "lucide-react";
+import { Download, FileText, RefreshCw, UploadCloud } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { TranslationOptions, type TranslationOptionsValue } from "../components/TranslationOptions";
-import type { BootstrapData, FileJobResult } from "../types";
-
-function downloadResult(result: FileJobResult) {
-  const bytes = Uint8Array.from(atob(result.contentBase64), (char) => char.charCodeAt(0));
-  const blob = new Blob([bytes], { type: result.mediaType });
-  const url = URL.createObjectURL(blob);
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.download = result.filename;
-  anchor.click();
-  URL.revokeObjectURL(url);
-}
+import { downloadBlob } from "../utils";
+import type { BootstrapData, FileJobStatus, FileOutputMode } from "../types";
 
 export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: () => Promise<void> }) {
   const { t } = useTranslation();
   const inputRef = useRef<HTMLInputElement>(null);
   const defaultProvider = useMemo(() => data.providers.find((provider) => provider.enabled)?.id || "", [data.providers]);
-  const [options, setOptions] = useState<TranslationOptionsValue>({ sourceLanguage: "auto", targetLanguage: "zh", providerId: defaultProvider, promptId: data.prompts[0]?.id || "", glossaryIds: [] });
+  const [options, setOptions] = useState<TranslationOptionsValue>(() => readOptions(defaultProvider, data.prompts[0]?.id || ""));
+  const [outputMode, setOutputMode] = useState<FileOutputMode>(() => readOutputMode());
   const [file, setFile] = useState<File | null>(null);
-  const [result, setResult] = useState<FileJobResult | null>(null);
-  const [working, setWorking] = useState(false);
+  const [jobs, setJobs] = useState<FileJobStatus[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [downloadingId, setDownloadingId] = useState("");
   const [error, setError] = useState("");
+  const knownStates = useRef(new Map<string, FileJobStatus["state"]>());
 
   const choose = useCallback((next: File | undefined) => {
     if (next) {
       setFile(next);
-      setResult(null);
       setError("");
     }
   }, []);
+
+  const refreshJobs = useCallback(async () => {
+    try {
+      const next = await api.fileJobs();
+      const firstLoad = knownStates.current.size === 0;
+      const completedSinceLastRefresh = next.some((job) => job.state === "completed" && knownStates.current.has(job.id) && knownStates.current.get(job.id) !== "completed");
+      for (const job of next) knownStates.current.set(job.id, job.state);
+      setJobs(next);
+      if (completedSinceLastRefresh || (firstLoad && next.some((job) => job.state === "completed"))) void onReload();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
+  }, [onReload]);
+
+  useEffect(() => {
+    if (!options.providerId && defaultProvider) setOptions((current) => ({ ...current, providerId: defaultProvider }));
+    if (options.promptId && !data.prompts.some((prompt) => prompt.id === options.promptId)) {
+      setOptions((current) => ({ ...current, promptId: data.prompts[0]?.id || "" }));
+    }
+  }, [data.prompts, defaultProvider, options.providerId, options.promptId]);
+
+  useEffect(() => {
+    localStorage.setItem("tranova-file-options", JSON.stringify(options));
+  }, [options]);
+
+  useEffect(() => {
+    localStorage.setItem("tranova-file-output-mode", outputMode);
+  }, [outputMode]);
 
   useEffect(() => {
     if (!("__TAURI_INTERNALS__" in window)) return;
@@ -63,24 +83,81 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
     };
   }, [choose]);
 
+  useEffect(() => {
+    let disposed = false;
+    const load = async () => {
+      try {
+        const next = await api.fileJobs();
+        if (disposed) return;
+        const firstLoad = knownStates.current.size === 0;
+        const completedSinceLastRefresh = next.some((job) => job.state === "completed" && knownStates.current.has(job.id) && knownStates.current.get(job.id) !== "completed");
+        for (const job of next) knownStates.current.set(job.id, job.state);
+        setJobs(next);
+        if (completedSinceLastRefresh || (firstLoad && next.some((job) => job.state === "completed"))) void onReload();
+      } catch (reason) {
+        if (!disposed) setError(reason instanceof Error ? reason.message : String(reason));
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 900);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [onReload]);
+
   const translate = async () => {
     if (!file || !options.providerId) return;
-    setWorking(true);
+    setSubmitting(true);
     setError("");
     try {
-      setResult(await api.translateFile(file, { ...options, promptId: options.promptId || undefined }));
-      await onReload();
+      const job = await api.translateFile(file, {
+        ...options,
+        promptId: options.promptId || undefined,
+        outputMode,
+      });
+      knownStates.current.set(job.id, job.state);
+      setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
+      setFile(null);
+      if (inputRef.current) inputRef.current.value = "";
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setWorking(false);
+      setSubmitting(false);
     }
   };
 
+  const downloadJob = async (job: FileJobStatus) => {
+    if (job.state !== "completed") return;
+    setDownloadingId(job.id);
+    setError("");
+    try {
+      downloadBlob(job.resultFilename, await api.downloadFileJob(job.id));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setDownloadingId("");
+    }
+  };
+
+  const changeOptions = (next: TranslationOptionsValue) => {
+    setOptions(next);
+    localStorage.setItem("tranova-file-options", JSON.stringify(next));
+  };
+
   return (
-    <section className="page">
+    <section className="page files-page">
       <div className="page-heading"><div><h1>{t("files.title")}</h1><p>{t("files.subtitle")}</p></div></div>
-      <TranslationOptions value={options} onChange={setOptions} providers={data.providers} prompts={data.prompts} glossaries={data.glossaries} />
+      <TranslationOptions value={options} onChange={changeOptions} providers={data.providers} prompts={data.prompts} glossaries={data.glossaries} />
+      <div className="file-output-options">
+        <label>
+          <span>{t("files.mode")}</span>
+          <select value={outputMode} onChange={(event) => setOutputMode(event.target.value as FileOutputMode)}>
+            <option value="translated">{t("files.translatedOnly")}</option>
+            <option value="bilingual">{t("files.bilingual")}</option>
+          </select>
+        </label>
+      </div>
       <button
         className={`drop-zone ${file ? "has-file" : ""}`}
         type="button"
@@ -94,19 +171,83 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
       </button>
       <input ref={inputRef} className="visually-hidden" type="file" accept=".docx,.pptx,.xlsx,.txt,.md,.markdown,.html,.htm,.csv,.json,.srt,.vtt,.png,.jpg,.jpeg,.webp" onChange={(event) => choose(event.target.files?.[0])} />
       {error && <div className="alert error-alert">{error}</div>}
-      {result && (
-        <div className="file-result">
-          <div><strong>{result.filename}</strong><span>{t("files.segments", { count: result.translatedSegments })}</span></div>
-          <button className="secondary-button" onClick={() => downloadResult(result)}><Download size={18} /> {t("files.download")}</button>
-        </div>
-      )}
       <div className="action-row">
-        <button className="primary-button" onClick={translate} disabled={!file || working || !options.providerId}>
-          <FileText size={18} /> {working ? t("files.working") : t("files.action")}
+        <button className="primary-button" onClick={translate} disabled={!file || submitting || !options.providerId}>
+          <FileText size={18} /> {submitting ? t("files.working") : t("files.action")}
+        </button>
+        <button className="icon-text-button" onClick={() => void refreshJobs()} title={t("files.refresh")} aria-label={t("files.refresh")}>
+          <RefreshCw size={17} /> {t("files.refresh")}
         </button>
       </div>
+      <section className="file-jobs-section">
+        <header className="section-heading"><h2>{t("files.jobs")}</h2></header>
+        {jobs.length === 0 ? <div className="empty-state">{t("files.noJobs")}</div> : (
+          <div className="file-job-list">
+            {jobs.map((job) => {
+              const percent = progressPercent(job);
+              return (
+                <article className={`file-job ${job.state}`} key={job.id}>
+                  <div className="file-job-heading">
+                    <div className="file-job-name"><strong>{job.filename}</strong><span>{job.outputMode === "bilingual" ? t("files.bilingual") : t("files.translatedOnly")}</span></div>
+                    <span className={`badge ${job.state === "completed" ? "enabled" : ""}`}>{t(`files.${job.state}`)}</span>
+                  </div>
+                  <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+                    <div className="progress-fill" style={{ width: `${percent}%` }} />
+                  </div>
+                  <div className="file-job-meta">
+                    <span>{t(`files.${job.stage}`)}</span>
+                    <span>{t("files.segments", { done: job.translatedSegments, total: job.totalSegments })}</span>
+                    <span>{t("files.batches", { done: job.completedBatches, total: job.totalBatches })}</span>
+                    {job.skippedSegments > 0 && <span>{t("files.skipped", { count: job.skippedSegments })}</span>}
+                  </div>
+                  {job.error && <div className="file-job-error">{job.error}</div>}
+                  {job.state === "completed" && (
+                    <div className="file-job-actions">
+                      <span className="muted">{job.resultFilename}</span>
+                      <button className="secondary-button" onClick={() => void downloadJob(job)} disabled={downloadingId === job.id}>
+                        <Download size={18} /> {t("files.download")}
+                      </button>
+                    </div>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        )}
+      </section>
     </section>
   );
+}
+
+function progressPercent(job: FileJobStatus) {
+  if (job.state === "completed") return 100;
+  if (job.totalSegments > 0) return Math.min(99, Math.round((job.translatedSegments / job.totalSegments) * 100));
+  return job.state === "processing" ? 4 : 0;
+}
+
+function readOptions(defaultProvider: string, defaultPrompt: string): TranslationOptionsValue {
+  const fallback: TranslationOptionsValue = {
+    sourceLanguage: "auto",
+    targetLanguage: "zh",
+    providerId: defaultProvider,
+    promptId: defaultPrompt,
+    glossaryIds: [],
+  };
+  try {
+    const stored = JSON.parse(localStorage.getItem("tranova-file-options") || "null") as Partial<TranslationOptionsValue> | null;
+    if (!stored || typeof stored !== "object") return fallback;
+    return {
+      ...fallback,
+      ...stored,
+      glossaryIds: Array.isArray(stored.glossaryIds) ? stored.glossaryIds : [],
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+function readOutputMode(): FileOutputMode {
+  return localStorage.getItem("tranova-file-output-mode") === "bilingual" ? "bilingual" : "translated";
 }
 
 function mimeTypeForName(filename: string) {
@@ -122,10 +263,6 @@ function mimeTypeForName(filename: string) {
     htm: "text/html",
     csv: "text/csv",
     json: "application/json",
-    png: "image/png",
-    jpg: "image/jpeg",
-    jpeg: "image/jpeg",
-    webp: "image/webp",
   };
   return (extension && types[extension]) || "application/octet-stream";
 }

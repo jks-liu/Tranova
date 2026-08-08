@@ -13,9 +13,10 @@ export function SettingsPage({ data, onReload }: { data: BootstrapData; onReload
   const save = async () => {
     setMessage(""); setError("");
     try {
-      await api.saveSettings(settings);
-      localStorage.setItem("tranova-language", settings.language);
-      await i18n.changeLanguage(settings.language);
+      const saved = await api.saveSettings(settings);
+      setSettings(saved);
+      localStorage.setItem("tranova-language", saved.language);
+      await i18n.changeLanguage(saved.language);
       setMessage(t("status.saved"));
       await onReload();
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
@@ -42,8 +43,11 @@ export function SettingsPage({ data, onReload }: { data: BootstrapData; onReload
       </div>
       <div className="settings-section">
         <h2>{t("settings.chunk")}</h2>
-        <label className="setting-row"><div><strong>{t("settings.chunk")}</strong></div><input type="number" min={500} max={50000} step={500} value={settings.maxChunkChars} onChange={(event) => setSettings({ ...settings, maxChunkChars: Number(event.target.value) })} /></label>
+        <label className="setting-row"><div><strong>{t("settings.chunk")}</strong><span>{t("settings.chunkHint")}</span></div><input type="number" min={500} max={50000} step={500} value={settings.maxChunkChars} onChange={(event) => setSettings({ ...settings, maxChunkChars: Number(event.target.value) })} /></label>
+        <label className="setting-row"><div><strong>{t("settings.concurrency")}</strong><span>{t("settings.concurrencyHint")}</span></div><input type="number" min={1} max={32} step={1} value={settings.maxConcurrentAi} onChange={(event) => setSettings({ ...settings, maxConcurrentAi: Number(event.target.value) })} /></label>
+        <label className="setting-row"><div><strong>{t("settings.timeout")}</strong><span>{t("settings.timeoutHint")}</span></div><input type="number" min={10} max={3600} step={10} value={settings.aiTimeoutSeconds} onChange={(event) => setSettings({ ...settings, aiTimeoutSeconds: Number(event.target.value) })} /></label>
       </div>
+      <div className="settings-version">{t("settings.version")}: v{data.version}</div>
       <div className="action-row"><button className="primary-button" onClick={save}><Save size={18} /> {t("common.save")}</button></div>
     </section>
   );

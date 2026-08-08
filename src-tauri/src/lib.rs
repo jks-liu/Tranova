@@ -1,6 +1,8 @@
 mod ai;
 mod files;
+mod jobs;
 mod models;
+mod scheduler;
 mod server;
 mod store;
 

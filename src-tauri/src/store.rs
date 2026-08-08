@@ -182,6 +182,8 @@ impl AppStore {
             ));
         }
         settings.max_chunk_chars = settings.max_chunk_chars.clamp(500, 50_000);
+        settings.max_concurrent_ai = settings.max_concurrent_ai.clamp(1, 32);
+        settings.ai_timeout_seconds = settings.ai_timeout_seconds.clamp(10, 3_600);
         self.inner.data.write().settings = settings.clone();
         self.persist()?;
         Ok(settings)

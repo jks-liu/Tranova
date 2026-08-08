@@ -1,9 +1,10 @@
-use std::time::Duration;
+use std::{error::Error as StdError, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::{
+    header::{HeaderMap, CONTENT_TYPE},
     multipart::{Form, Part},
-    Client, Proxy,
+    Client, Proxy, StatusCode,
 };
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -18,7 +19,16 @@ pub enum AiError {
     #[error("{0}")]
     Message(String),
     #[error("Network request failed: {0}")]
-    Request(#[from] reqwest::Error),
+    Request(String),
+}
+
+const AI_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_REQUEST_ATTEMPTS: usize = 3;
+
+struct ProviderResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    body: String,
 }
 
 pub async fn translate(
@@ -51,24 +61,42 @@ pub async fn translate(
     })
 }
 
-pub async fn test_provider(store: &AppStore, id: &str) -> Result<String, AiError> {
+pub async fn translate_batch(
+    store: &AppStore,
+    request: &TranslateRequest,
+    texts: &[String],
+) -> Result<Vec<String>, AiError> {
+    if texts.is_empty() {
+        return Ok(Vec::new());
+    }
+    if request.source_language.trim().is_empty() || request.target_language.trim().is_empty() {
+        return Err(AiError::Message(
+            "Source and target languages are required".to_string(),
+        ));
+    }
     let data = store.snapshot();
     let provider = data
         .providers
         .iter()
-        .find(|provider| provider.id == id)
+        .find(|provider| provider.id == request.provider_id)
+        .filter(|provider| provider.enabled)
         .cloned()
-        .ok_or_else(|| AiError::Message("Provider was not found".to_string()))?;
-    let request = TranslateRequest {
-        text: "Reply with OK only.".to_string(),
-        source_language: "English".to_string(),
-        target_language: "English".to_string(),
-        provider_id: id.to_string(),
-        prompt_id: None,
-        glossary_ids: Vec::new(),
-    };
-    translate_with_data(&data, &provider, &request).await?;
-    Ok(format!("{} responded successfully", provider.name))
+        .ok_or_else(|| {
+            AiError::Message("Selected AI provider does not exist or is disabled".to_string())
+        })?;
+    let mut batch_request = request.clone();
+    batch_request.text = serde_json::to_string(texts).map_err(|error| {
+        AiError::Message(format!("Unable to encode translation batch: {error}"))
+    })?;
+    let instruction = format!(
+        "The user text is a JSON array containing {} independent segments. Translate every segment in order. Return ONLY a valid JSON array of strings with exactly {} items. Do not add markdown, commentary, labels or code fences.",
+        texts.len(),
+        texts.len()
+    );
+    let response =
+        translate_with_data_instruction(&data, &provider, &batch_request, Some(&instruction))
+            .await?;
+    parse_batch_response(&response, texts.len())
 }
 
 pub async fn translate_image(
@@ -87,7 +115,7 @@ pub async fn translate_image(
         .ok_or_else(|| {
             AiError::Message("Selected provider does not support image input/output".to_string())
         })?;
-    let client = build_client(&data.settings.proxy_url)?;
+    let client = build_client(&data.settings.proxy_url, data.settings.ai_timeout_seconds)?;
     let endpoint = if provider.base_url.ends_with("/images/edits") {
         provider.base_url.clone()
     } else {
@@ -114,9 +142,15 @@ pub async fn translate_image(
     if !provider.api_key.trim().is_empty() {
         call = call.bearer_auth(provider.api_key.trim());
     }
-    let response = call.send().await?;
+    let response = call
+        .send()
+        .await
+        .map_err(|error| request_error("image provider request", error))?;
     let status = response.status();
-    let body: Value = response.json().await?;
+    let body: Value = response
+        .json()
+        .await
+        .map_err(|error| request_error("reading image provider response", error))?;
     if !status.is_success() {
         return Err(AiError::Message(provider_error(&body, status.as_u16())));
     }
@@ -174,8 +208,21 @@ async fn translate_with_data(
     provider: &Provider,
     request: &TranslateRequest,
 ) -> Result<String, AiError> {
-    let (system, user) = build_messages(data, request);
-    let client = build_client(&data.settings.proxy_url)?;
+    translate_with_data_instruction(data, provider, request, None).await
+}
+
+async fn translate_with_data_instruction(
+    data: &AppData,
+    provider: &Provider,
+    request: &TranslateRequest,
+    extra_system_instruction: Option<&str>,
+) -> Result<String, AiError> {
+    let (mut system, user) = build_messages(data, request);
+    if let Some(instruction) = extra_system_instruction {
+        system.push_str("\n\n");
+        system.push_str(instruction);
+    }
+    let client = build_client(&data.settings.proxy_url, data.settings.ai_timeout_seconds)?;
     let response = match provider.kind {
         ProviderKind::Ollama => call_ollama(&client, provider, &system, &user).await?,
         _ => call_openai_compatible(&client, provider, &system, &user).await?,
@@ -189,14 +236,81 @@ async fn translate_with_data(
     Ok(response.to_string())
 }
 
-fn build_client(proxy_url: &str) -> Result<Client, AiError> {
-    let mut builder = Client::builder().timeout(Duration::from_secs(180));
+fn parse_batch_response(response: &str, expected: usize) -> Result<Vec<String>, AiError> {
+    let cleaned = response
+        .trim()
+        .strip_prefix("```json")
+        .or_else(|| response.trim().strip_prefix("```JSON"))
+        .or_else(|| response.trim().strip_prefix("```"))
+        .unwrap_or(response.trim())
+        .strip_suffix("```")
+        .unwrap_or_else(|| {
+            response
+                .trim()
+                .strip_prefix("```json")
+                .or_else(|| response.trim().strip_prefix("```JSON"))
+                .or_else(|| response.trim().strip_prefix("```"))
+                .unwrap_or(response.trim())
+        })
+        .trim();
+    let value = serde_json::from_str::<Value>(cleaned)
+        .or_else(|_| {
+            let start = cleaned.find('[').ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "translation batch is not a JSON array",
+                ))
+            })?;
+            let end = cleaned.rfind(']').ok_or_else(|| {
+                serde_json::Error::io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "translation batch is not a JSON array",
+                ))
+            })?;
+            serde_json::from_str(&cleaned[start..=end])
+        })
+        .map_err(|error| {
+            AiError::Message(format!("AI returned an invalid translation batch: {error}"))
+        })?;
+    let items = value
+        .as_array()
+        .or_else(|| value.get("translations").and_then(Value::as_array))
+        .ok_or_else(|| {
+            AiError::Message("AI returned a translation batch that is not an array".to_string())
+        })?;
+    if items.len() != expected {
+        return Err(AiError::Message(format!(
+            "AI returned {} translations for {} input segments",
+            items.len(),
+            expected
+        )));
+    }
+    items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| {
+            item.as_str().map(str::to_string).ok_or_else(|| {
+                AiError::Message(format!(
+                    "AI translation batch item {} is not text",
+                    index + 1
+                ))
+            })
+        })
+        .collect()
+}
+
+fn build_client(proxy_url: &str, timeout_seconds: u64) -> Result<Client, AiError> {
+    let mut builder = Client::builder();
     if !proxy_url.trim().is_empty() {
         let proxy = Proxy::all(proxy_url.trim())
             .map_err(|error| AiError::Message(format!("Invalid proxy URL: {error}")))?;
         builder = builder.proxy(proxy);
     }
-    builder.build().map_err(AiError::Request)
+    builder
+        .connect_timeout(AI_CONNECT_TIMEOUT)
+        .timeout(Duration::from_secs(timeout_seconds.max(1)))
+        .build()
+        .map_err(|error| request_error("building HTTP client", error))
 }
 
 fn build_messages(data: &AppData, request: &TranslateRequest) -> (String, String) {
@@ -260,7 +374,7 @@ async fn call_openai_compatible(
             provider.base_url.trim_end_matches('/')
         )
     };
-    let mut call = client.post(endpoint).json(&json!({
+    let body = json!({
         "model": provider.model,
         "messages": [
             { "role": "system", "content": system },
@@ -268,16 +382,16 @@ async fn call_openai_compatible(
         ],
         "temperature": 0.2,
         "stream": false
-    }));
-    if !provider.api_key.trim().is_empty() {
-        call = call.bearer_auth(provider.api_key.trim());
-    }
-    let response = call.send().await?;
-    let status = response.status();
-    let body: Value = response.json().await?;
-    if !status.is_success() {
-        return Err(AiError::Message(provider_error(&body, status.as_u16())));
-    }
+    });
+    let response = send_json_request(
+        client,
+        &endpoint,
+        &body,
+        (!provider.api_key.trim().is_empty()).then_some(provider.api_key.trim()),
+        "OpenAI-compatible request",
+    )
+    .await?;
+    let body = parse_provider_json(response, "OpenAI-compatible provider")?;
     content_from_openai_response(&body).ok_or_else(|| {
         AiError::Message("Provider response did not contain choices[0].message.content".to_string())
     })
@@ -294,30 +408,145 @@ async fn call_ollama(
     } else {
         format!("{}/api/chat", provider.base_url.trim_end_matches('/'))
     };
-    let response = client
-        .post(endpoint)
-        .json(&json!({
-            "model": provider.model,
-            "messages": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": user }
-            ],
-            "stream": false,
-            "options": { "temperature": 0.2 }
-        }))
-        .send()
-        .await?;
-    let status = response.status();
-    let body: Value = response.json().await?;
-    if !status.is_success() {
-        return Err(AiError::Message(provider_error(&body, status.as_u16())));
-    }
+    let body = json!({
+        "model": provider.model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ],
+        "stream": false,
+        "options": { "temperature": 0.2 }
+    });
+    let response = send_json_request(client, &endpoint, &body, None, "Ollama request").await?;
+    let body = parse_provider_json(response, "Ollama")?;
     body.pointer("/message/content")
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| {
             AiError::Message("Ollama response did not contain message.content".to_string())
         })
+}
+
+async fn send_json_request(
+    client: &Client,
+    endpoint: &str,
+    body: &Value,
+    api_key: Option<&str>,
+    operation: &str,
+) -> Result<ProviderResponse, AiError> {
+    let mut last_error = None;
+    for attempt in 1..=MAX_REQUEST_ATTEMPTS {
+        match send_json_attempt(client, endpoint, body, api_key).await {
+            Ok(response) => return Ok(response),
+            Err(error) if retryable_request_error(&error) && attempt < MAX_REQUEST_ATTEMPTS => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+            }
+            Err(error) => {
+                let attempts = if last_error.is_some() {
+                    format!(" after {attempt} attempts")
+                } else {
+                    String::new()
+                };
+                return Err(request_error(&format!("{operation}{attempts}"), error));
+            }
+        }
+    }
+
+    Err(request_error(
+        &format!("{operation} after {MAX_REQUEST_ATTEMPTS} attempts"),
+        last_error.expect("a request attempt must fail before reaching this point"),
+    ))
+}
+
+async fn send_json_attempt(
+    client: &Client,
+    endpoint: &str,
+    body: &Value,
+    api_key: Option<&str>,
+) -> Result<ProviderResponse, reqwest::Error> {
+    let mut call = client.post(endpoint).json(body);
+    if let Some(api_key) = api_key {
+        call = call.bearer_auth(api_key);
+    }
+    let response = call.send().await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().await?;
+    Ok(ProviderResponse {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn retryable_request_error(error: &reqwest::Error) -> bool {
+    !error.is_timeout()
+        && (error.is_connect() || error.is_request() || error.is_body() || error.is_decode())
+}
+
+fn request_error(operation: &str, error: reqwest::Error) -> AiError {
+    let category = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() || error.is_decode() {
+        "response body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "unknown"
+    };
+    let mut details = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        details.push_str("; cause: ");
+        details.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    let hint = if error.is_timeout() {
+        "; the provider may have accepted the request but did not finish within the client timeout"
+    } else {
+        ""
+    };
+    AiError::Request(format!("{operation} [{category}]: {details}{hint}"))
+}
+
+fn parse_provider_json(response: ProviderResponse, provider_name: &str) -> Result<Value, AiError> {
+    let status = response.status;
+    let content_type = response
+        .headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown");
+    if !status.is_success() {
+        if let Ok(body) = serde_json::from_str::<Value>(&response.body) {
+            return Err(AiError::Message(provider_error(&body, status.as_u16())));
+        }
+        return Err(AiError::Message(format!(
+            "{provider_name} returned HTTP {status} (Content-Type: {content_type}): {}",
+            response_excerpt(&response.body)
+        )));
+    }
+    serde_json::from_str(&response.body).map_err(|error| {
+        AiError::Message(format!(
+            "{provider_name} returned invalid JSON (HTTP {status}, Content-Type: {content_type}): {error}; response body: {}",
+            response_excerpt(&response.body)
+        ))
+    })
+}
+
+fn response_excerpt(body: &str) -> String {
+    const MAX_RESPONSE_EXCERPT_CHARS: usize = 2_000;
+    let excerpt = body
+        .chars()
+        .take(MAX_RESPONSE_EXCERPT_CHARS)
+        .collect::<String>();
+    if body.chars().count() > MAX_RESPONSE_EXCERPT_CHARS {
+        format!("{excerpt}...")
+    } else {
+        excerpt
+    }
 }
 
 fn content_from_openai_response(body: &Value) -> Option<String> {
@@ -348,10 +577,14 @@ fn provider_error(body: &Value, status: u16) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_messages, image_format_matches, image_output_format};
+    use super::{
+        build_messages, image_format_matches, image_output_format, parse_batch_response,
+        parse_provider_json, ProviderResponse,
+    };
     use crate::models::{
         AppData, Glossary, GlossaryEntry, PromptTemplate, Provider, ProviderKind, TranslateRequest,
     };
+    use reqwest::{header::HeaderMap, StatusCode};
 
     #[test]
     fn prompt_includes_every_selected_glossary() {
@@ -393,6 +626,50 @@ mod tests {
         assert!(image_format_matches("image.jpg", &[0xff, 0xd8, 0xff, 0xdb]));
         assert!(image_format_matches("image.webp", b"RIFF1234WEBPdata"));
         assert!(!image_format_matches("image.jpg", b"\x89PNG\r\n\x1a\n"));
+    }
+
+    #[test]
+    fn batch_response_requires_the_expected_number_of_strings() {
+        assert_eq!(
+            parse_batch_response(r#"["one","two"]"#, 2).unwrap(),
+            vec!["one", "two"]
+        );
+        assert!(parse_batch_response(r#"["one"]"#, 2).is_err());
+    }
+
+    #[test]
+    fn provider_http_errors_keep_the_raw_response_context() {
+        let error = parse_provider_json(
+            ProviderResponse {
+                status: StatusCode::BAD_GATEWAY,
+                headers: HeaderMap::new(),
+                body: "upstream model failed".to_string(),
+            },
+            "Ollama",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("HTTP 502"));
+        assert!(error.contains("upstream model failed"));
+    }
+
+    #[test]
+    fn provider_json_errors_keep_content_type_and_body_context() {
+        let error = parse_provider_json(
+            ProviderResponse {
+                status: StatusCode::OK,
+                headers: HeaderMap::from_iter([(
+                    reqwest::header::CONTENT_TYPE,
+                    "text/plain".parse().unwrap(),
+                )]),
+                body: "not json".to_string(),
+            },
+            "OpenAI-compatible provider",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("Content-Type: text/plain"));
+        assert!(error.contains("not json"));
     }
 
     #[tokio::test]
