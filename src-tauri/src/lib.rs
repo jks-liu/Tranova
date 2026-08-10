@@ -9,6 +9,8 @@ mod store;
 use std::{fs, path::PathBuf};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use jobs::FileJobManager;
+use models::FileJobStatus;
 use serde::Serialize;
 use server::ServerState;
 use store::AppStore;
@@ -17,11 +19,34 @@ use tauri::Manager;
 #[derive(Clone)]
 struct DesktopState {
     server_url: String,
+    jobs: FileJobManager,
+    store: AppStore,
 }
 
 #[tauri::command]
 fn server_url(state: tauri::State<'_, DesktopState>) -> String {
     state.server_url.clone()
+}
+
+#[tauri::command]
+fn save_file_job(
+    state: tauri::State<'_, DesktopState>,
+    job_id: String,
+    destination: String,
+) -> Result<FileJobStatus, String> {
+    let destination = PathBuf::from(destination);
+    let status = state
+        .jobs
+        .save_to_path(&job_id, &destination)
+        .map_err(|error| error.to_string())?;
+    if let Some(parent) = destination
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        // The file is already saved; a preference persistence error must not turn that into a failed download.
+        let _ = state.store.set_last_download_directory(parent);
+    }
+    Ok(status)
 }
 
 #[derive(Serialize)]
@@ -60,13 +85,24 @@ pub fn run() {
     let server_state = ServerState {
         store,
         server_url: server_address.clone(),
+        jobs: FileJobManager::new(),
     };
+    let jobs = server_state.jobs.clone();
+    let store = server_state.store.clone();
 
     tauri::Builder::default()
         .manage(DesktopState {
             server_url: server_address,
+            jobs,
+            store,
         })
-        .invoke_handler(tauri::generate_handler![server_url, read_dropped_file])
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            server_url,
+            read_dropped_file,
+            save_file_job
+        ])
         .setup(move |app| {
             let asset_dir = web_asset_dir(app.handle());
             let settings = server_state.store.settings();
@@ -89,6 +125,7 @@ pub fn run_server() {
     let state = ServerState {
         store,
         server_url: server_address,
+        jobs: FileJobManager::new(),
     };
     let assets = standalone_asset_dir();
     let runtime = tokio::runtime::Runtime::new().expect("unable to initialize the async runtime");

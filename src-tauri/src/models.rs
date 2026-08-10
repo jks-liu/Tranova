@@ -74,10 +74,33 @@ pub struct AppSettings {
     pub web_port: u16,
     #[serde(default = "default_chunk_chars")]
     pub max_chunk_chars: usize,
+    #[serde(default = "default_chunk_segments")]
+    pub max_chunk_segments: usize,
     #[serde(default = "default_concurrent_ai")]
     pub max_concurrent_ai: usize,
+    #[serde(default = "default_batch_retries")]
+    pub max_batch_retries: usize,
     #[serde(default = "default_ai_timeout_seconds")]
     pub ai_timeout_seconds: u64,
+    #[serde(default)]
+    pub download_location: DownloadLocation,
+    #[serde(default)]
+    pub custom_download_directory: String,
+    #[serde(default)]
+    pub auto_download_files: bool,
+    #[serde(default)]
+    pub ask_download_location: bool,
+    #[serde(default)]
+    pub last_download_directory: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadLocation {
+    #[default]
+    Source,
+    Downloads,
+    Custom,
 }
 
 fn default_language() -> String {
@@ -92,8 +115,14 @@ fn default_web_port() -> u16 {
 fn default_chunk_chars() -> usize {
     6000
 }
+fn default_chunk_segments() -> usize {
+    100
+}
 fn default_concurrent_ai() -> usize {
     3
+}
+fn default_batch_retries() -> usize {
+    5
 }
 fn default_ai_timeout_seconds() -> u64 {
     180
@@ -107,8 +136,15 @@ impl Default for AppSettings {
             web_host: default_web_host(),
             web_port: default_web_port(),
             max_chunk_chars: default_chunk_chars(),
+            max_chunk_segments: default_chunk_segments(),
             max_concurrent_ai: default_concurrent_ai(),
+            max_batch_retries: default_batch_retries(),
             ai_timeout_seconds: default_ai_timeout_seconds(),
+            download_location: DownloadLocation::default(),
+            custom_download_directory: String::new(),
+            auto_download_files: false,
+            ask_download_location: false,
+            last_download_directory: String::new(),
         }
     }
 }
@@ -206,7 +242,7 @@ impl TranslateOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppSettings, TranslateOptions};
+    use super::{AppSettings, DownloadLocation, TranslateOptions};
 
     #[test]
     fn settings_default_timeout_is_180_seconds() {
@@ -216,6 +252,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings.ai_timeout_seconds, 180);
+        assert_eq!(settings.max_chunk_segments, 100);
+        assert_eq!(settings.max_batch_retries, 5);
+        assert_eq!(settings.download_location, DownloadLocation::Source);
+        assert!(settings.custom_download_directory.is_empty());
+        assert!(!settings.auto_download_files);
+        assert!(!settings.ask_download_location);
     }
 
     #[test]
@@ -256,9 +298,23 @@ pub struct FileProgress {
     pub stage: String,
     pub total_segments: usize,
     pub translated_segments: usize,
+    pub failed_segments: usize,
     pub skipped_segments: usize,
     pub total_batches: usize,
     pub completed_batches: usize,
+    pub streaming_batch: Option<usize>,
+    pub streaming_segments: usize,
+    pub streaming_batch_segments: usize,
+    pub streaming_text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileBatchFailure {
+    pub id: usize,
+    pub segment_count: usize,
+    pub attempts: usize,
+    pub error: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -280,11 +336,19 @@ pub struct FileJobStatus {
     pub stage: String,
     pub total_segments: usize,
     pub translated_segments: usize,
+    pub failed_segments: usize,
     pub skipped_segments: usize,
     pub total_batches: usize,
     pub completed_batches: usize,
+    pub failed_batches: Vec<FileBatchFailure>,
+    pub streaming_batch: Option<usize>,
+    pub streaming_segments: usize,
+    pub streaming_batch_segments: usize,
+    pub streaming_text: Option<String>,
     pub result_filename: String,
     pub media_type: String,
     pub error: Option<String>,
     pub created_at: String,
+    pub source_path: Option<String>,
+    pub downloaded_path: Option<String>,
 }

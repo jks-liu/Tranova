@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    ai::{self, AiError},
+    ai::{self, AiError, StreamCallback},
     models::{TranslateRequest, TranslationResult},
     store::AppStore,
 };
@@ -30,6 +30,7 @@ enum Command {
         texts: Vec<String>,
         response: oneshot::Sender<Result<Vec<String>, AiError>>,
         priority: Priority,
+        stream: Option<StreamCallback>,
     },
     TranslateImage {
         request: TranslateRequest,
@@ -49,6 +50,7 @@ enum Work {
         request: TranslateRequest,
         texts: Vec<String>,
         response: oneshot::Sender<Result<Vec<String>, AiError>>,
+        stream: Option<StreamCallback>,
     },
     TranslateImage {
         request: TranslateRequest,
@@ -88,6 +90,7 @@ impl AiScheduler {
         request: TranslateRequest,
         texts: Vec<String>,
         priority: Priority,
+        stream: Option<StreamCallback>,
     ) -> Result<Vec<String>, AiError> {
         let (response, receiver) = oneshot::channel();
         self.sender
@@ -96,6 +99,7 @@ impl AiScheduler {
                 texts,
                 response,
                 priority,
+                stream,
             })
             .map_err(|_| AiError::Message("AI scheduler is unavailable".to_string()))?;
         receiver
@@ -127,6 +131,7 @@ impl AiScheduler {
 }
 
 struct Completion {
+    priority: Priority,
     work: Work,
     result: WorkResult,
 }
@@ -146,23 +151,37 @@ async fn run_scheduler(store: AppStore, mut receiver: mpsc::UnboundedReceiver<Co
     let (completion_sender, mut completion_receiver) = mpsc::unbounded_channel();
     let mut high: VecDeque<PendingWork> = VecDeque::new();
     let mut low: VecDeque<PendingWork> = VecDeque::new();
-    let mut active = 0usize;
+    let mut active_high = 0usize;
+    let mut active_low = 0usize;
 
     loop {
-        while active < store.settings().max_concurrent_ai.max(1) {
-            let Some(pending) = high.pop_front().or_else(|| low.pop_front()) else {
+        let max_active = store.settings().max_concurrent_ai.max(1);
+        let max_low_active = max_active.saturating_sub(1).max(1);
+        while active_high + active_low < max_active {
+            let pending = if let Some(pending) = high.pop_front() {
+                pending
+            } else if active_low < max_low_active {
+                let Some(pending) = low.pop_front() else {
+                    break;
+                };
+                pending
+            } else {
                 break;
             };
-            active += 1;
+            match pending.priority {
+                Priority::High => active_high += 1,
+                Priority::Low => active_low += 1,
+            }
+            let priority = pending.priority;
             let store = store.clone();
             let completion_sender = completion_sender.clone();
             tokio::spawn(async move {
-                let completion = execute_work(store, pending.work).await;
+                let completion = execute_work(store, priority, pending.work).await;
                 let _ = completion_sender.send(completion);
             });
         }
 
-        if active == 0 && high.is_empty() && low.is_empty() {
+        if active_high + active_low == 0 && high.is_empty() && low.is_empty() {
             let Some(command) = receiver.recv().await else {
                 return;
             };
@@ -180,7 +199,10 @@ async fn run_scheduler(store: AppStore, mut receiver: mpsc::UnboundedReceiver<Co
             }
             completion = completion_receiver.recv() => {
                 if let Some(completion) = completion {
-                    active = active.saturating_sub(1);
+                    match completion.priority {
+                        Priority::High => active_high = active_high.saturating_sub(1),
+                        Priority::Low => active_low = active_low.saturating_sub(1),
+                    }
                     send_completion(completion);
                 }
             }
@@ -203,12 +225,14 @@ fn enqueue(command: Command, high: &mut VecDeque<PendingWork>, low: &mut VecDequ
             texts,
             response,
             priority,
+            stream,
         } => PendingWork {
             priority,
             work: Work::TranslateBatch {
                 request,
                 texts,
                 response,
+                stream,
             },
         },
         Command::TranslateImage {
@@ -233,11 +257,12 @@ fn enqueue(command: Command, high: &mut VecDeque<PendingWork>, low: &mut VecDequ
     }
 }
 
-async fn execute_work(store: AppStore, work: Work) -> Completion {
+async fn execute_work(store: AppStore, priority: Priority, work: Work) -> Completion {
     match work {
         Work::Translate { request, response } => {
             let result = ai::translate(&store, &request).await;
             Completion {
+                priority,
                 work: Work::Translate { request, response },
                 result: WorkResult::Translate(result),
             }
@@ -246,13 +271,16 @@ async fn execute_work(store: AppStore, work: Work) -> Completion {
             request,
             texts,
             response,
+            stream,
         } => {
-            let result = ai::translate_batch(&store, &request, &texts).await;
+            let result = ai::translate_batch(&store, &request, &texts, stream.clone()).await;
             Completion {
+                priority,
                 work: Work::TranslateBatch {
                     request,
                     texts,
                     response,
+                    stream,
                 },
                 result: WorkResult::TranslateBatch(result),
             }
@@ -265,6 +293,7 @@ async fn execute_work(store: AppStore, work: Work) -> Completion {
         } => {
             let result = ai::translate_image(&store, &request, &filename, image).await;
             Completion {
+                priority,
                 work: Work::TranslateImage {
                     request,
                     filename,

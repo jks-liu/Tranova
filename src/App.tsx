@@ -55,9 +55,8 @@ export default function App() {
     );
   }
 
-  const pages: Record<View, React.ReactNode> = {
+  const pages: Record<Exclude<View, "files">, React.ReactNode> = {
     translate: <TranslatePage data={data} onReload={load} />,
-    files: <FilesPage data={data} onReload={load} />,
     history: <HistoryPage data={data} onReload={load} />,
     glossaries: <GlossariesPage data={data} onReload={load} />,
     prompts: <PromptsPage data={data} onReload={load} />,
@@ -65,5 +64,12 @@ export default function App() {
     settings: <SettingsPage data={data} onReload={load} />,
   };
 
-  return <Layout view={view} onViewChange={setView} connected={true}>{pages[view]}</Layout>;
+  return (
+    <Layout view={view} onViewChange={setView} connected={true}>
+      <div hidden={view !== "files"}>
+        <FilesPage data={data} onReload={load} />
+      </div>
+      {view !== "files" && pages[view]}
+    </Layout>
+  );
 }

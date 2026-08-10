@@ -1,4 +1,8 @@
-use std::{fs, io, path::PathBuf, sync::Arc};
+use std::{
+    fs, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use directories::ProjectDirs;
 use parking_lot::RwLock;
@@ -182,11 +186,27 @@ impl AppStore {
             ));
         }
         settings.max_chunk_chars = settings.max_chunk_chars.clamp(500, 50_000);
+        settings.max_chunk_segments = settings.max_chunk_segments.clamp(1, 10_000);
         settings.max_concurrent_ai = settings.max_concurrent_ai.clamp(1, 32);
+        settings.max_batch_retries = settings.max_batch_retries.min(20);
         settings.ai_timeout_seconds = settings.ai_timeout_seconds.clamp(10, 3_600);
+        settings.custom_download_directory = settings.custom_download_directory.trim().to_string();
+        settings.last_download_directory = settings.last_download_directory.trim().to_string();
         self.inner.data.write().settings = settings.clone();
         self.persist()?;
         Ok(settings)
+    }
+
+    pub fn set_last_download_directory(&self, directory: &Path) -> Result<(), io::Error> {
+        let directory = directory.to_string_lossy().trim().to_string();
+        if directory.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "A download directory is required",
+            ));
+        }
+        self.inner.data.write().settings.last_download_directory = directory;
+        self.persist()
     }
 
     pub fn replace_glossaries(&self, glossaries: Vec<Glossary>) -> Result<(), io::Error> {

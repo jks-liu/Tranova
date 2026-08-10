@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     io::{Cursor, Read, Write},
     sync::Arc,
 };
@@ -10,11 +11,16 @@ use quick_xml::{
 };
 use serde_json::Value;
 use thiserror::Error;
-use tokio::task::JoinSet;
+use tokio::{
+    sync::mpsc,
+    task::JoinSet,
+    time::{sleep, Duration},
+};
 use zip::{write::FileOptions, CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::{
-    models::{FileOutputMode, FileProgress, TranslateRequest},
+    ai::StreamCallback,
+    models::{FileBatchFailure, FileOutputMode, FileProgress, TranslateRequest},
     scheduler::{AiScheduler, Priority},
     store::AppStore,
 };
@@ -46,16 +52,45 @@ pub struct FileTranslationResult {
     pub skipped_segments: usize,
     pub total_segments: usize,
     pub total_batches: usize,
+    pub failed_segments: usize,
+    pub failed_batches: Vec<FileBatchFailure>,
+    pub retry_context: Option<FileRetryContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FileRetryContext {
+    filename: String,
+    bytes: Vec<u8>,
+    options: TranslateRequest,
+    output_mode: FileOutputMode,
+    cached_batches: HashMap<usize, CachedBatch>,
+}
+
+#[derive(Debug, Clone)]
+enum CachedBatch {
+    Text(Vec<String>),
+    Image(Vec<u8>),
+}
+
+#[derive(Default)]
+struct BatchState {
+    cached_batches: HashMap<usize, CachedBatch>,
+    failed_batches: Vec<FileBatchFailure>,
 }
 
 #[derive(Default)]
 struct Counts {
     translated: usize,
+    failed: usize,
     skipped: usize,
     total_segments: usize,
     total_batches: usize,
     completed_batches: usize,
     stage: String,
+    streaming_batch: Option<usize>,
+    streaming_segments: usize,
+    streaming_batch_segments: usize,
+    streaming_text: Option<String>,
 }
 
 pub async fn translate_file(
@@ -67,6 +102,61 @@ pub async fn translate_file(
     output_mode: FileOutputMode,
     progress: ProgressCallback,
 ) -> Result<FileTranslationResult, FileError> {
+    translate_file_with_cache(
+        store,
+        scheduler,
+        filename,
+        bytes,
+        options,
+        output_mode,
+        progress,
+        HashMap::new(),
+    )
+    .await
+}
+
+pub async fn retry_failed_batches(
+    store: &AppStore,
+    scheduler: &AiScheduler,
+    context: FileRetryContext,
+    progress: ProgressCallback,
+) -> Result<FileTranslationResult, FileError> {
+    let FileRetryContext {
+        filename,
+        bytes,
+        options,
+        output_mode,
+        cached_batches,
+    } = context;
+    translate_file_with_cache(
+        store,
+        scheduler,
+        &filename,
+        bytes,
+        options,
+        output_mode,
+        progress,
+        cached_batches,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn translate_file_with_cache(
+    store: &AppStore,
+    scheduler: &AiScheduler,
+    filename: &str,
+    bytes: Vec<u8>,
+    options: TranslateRequest,
+    output_mode: FileOutputMode,
+    progress: ProgressCallback,
+    cached_batches: HashMap<usize, CachedBatch>,
+) -> Result<FileTranslationResult, FileError> {
+    let source_bytes = bytes.clone();
+    let mut batch_state = BatchState {
+        cached_batches,
+        ..BatchState::default()
+    };
     let extension = filename
         .rsplit('.')
         .next()
@@ -88,6 +178,7 @@ pub async fn translate_file(
                 OfficeKind::Word,
                 &mut counts,
                 &progress,
+                &mut batch_state,
             )
             .await?
         }
@@ -101,6 +192,7 @@ pub async fn translate_file(
                 OfficeKind::PowerPoint,
                 &mut counts,
                 &progress,
+                &mut batch_state,
             )
             .await?
         }
@@ -114,6 +206,7 @@ pub async fn translate_file(
                 OfficeKind::Excel,
                 &mut counts,
                 &progress,
+                &mut batch_state,
             )
             .await?
         }
@@ -126,6 +219,7 @@ pub async fn translate_file(
                 output_mode,
                 &mut counts,
                 &progress,
+                &mut batch_state,
             )
             .await?
         }
@@ -138,6 +232,7 @@ pub async fn translate_file(
                 output_mode,
                 &mut counts,
                 &progress,
+                &mut batch_state,
             )
             .await?
         }
@@ -150,6 +245,7 @@ pub async fn translate_file(
                 output_mode,
                 &mut counts,
                 &progress,
+                &mut batch_state,
             )
             .await?
         }
@@ -162,6 +258,7 @@ pub async fn translate_file(
                 output_mode,
                 &mut counts,
                 &progress,
+                &mut batch_state,
             )
             .await?
         }
@@ -174,6 +271,7 @@ pub async fn translate_file(
                 &options,
                 &mut counts,
                 &progress,
+                &mut batch_state,
             )
             .await?
         }
@@ -185,7 +283,22 @@ pub async fn translate_file(
         }
     };
     counts.stage = "completed".to_string();
+    counts.streaming_batch = None;
+    counts.streaming_segments = 0;
+    counts.streaming_batch_segments = 0;
+    counts.streaming_text = None;
     report(&counts, &progress);
+    let retry_context = if batch_state.failed_batches.is_empty() {
+        None
+    } else {
+        Some(FileRetryContext {
+            filename: filename.to_string(),
+            bytes: source_bytes,
+            options: options.clone(),
+            output_mode,
+            cached_batches: batch_state.cached_batches,
+        })
+    };
     Ok(FileTranslationResult {
         filename: translated_filename(filename),
         media_type: mime_guess::from_path(filename)
@@ -196,6 +309,9 @@ pub async fn translate_file(
         skipped_segments: counts.skipped,
         total_segments: counts.total_segments,
         total_batches: counts.total_batches,
+        failed_segments: counts.failed,
+        failed_batches: batch_state.failed_batches,
+        retry_context,
     })
 }
 
@@ -204,35 +320,84 @@ fn report(counts: &Counts, progress: &ProgressCallback) {
         stage: counts.stage.clone(),
         total_segments: counts.total_segments,
         translated_segments: counts.translated,
+        failed_segments: counts.failed,
         skipped_segments: counts.skipped,
         total_batches: counts.total_batches,
         completed_batches: counts.completed_batches,
+        streaming_batch: counts.streaming_batch,
+        streaming_segments: counts.streaming_segments,
+        streaming_batch_segments: counts.streaming_batch_segments,
+        streaming_text: counts.streaming_text.clone(),
     });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_image_file(
-    _store: &AppStore,
+    store: &AppStore,
     scheduler: &AiScheduler,
     filename: &str,
     bytes: Vec<u8>,
     options: &TranslateRequest,
     counts: &mut Counts,
     progress: &ProgressCallback,
+    state: &mut BatchState,
 ) -> Result<Vec<u8>, FileError> {
     counts.stage = "translating".to_string();
+    let batch_id = counts.total_batches;
     counts.total_segments += 1;
     counts.total_batches += 1;
     report(counts, progress);
-    let translated = scheduler
-        .translate_image(options.clone(), filename.to_string(), bytes, Priority::Low)
-        .await
-        .map_err(|error| FileError::Message(error.to_string()))?;
-    counts.translated += 1;
+    if let Some(CachedBatch::Image(translated)) = state.cached_batches.get(&batch_id) {
+        counts.translated += 1;
+        counts.completed_batches += 1;
+        report(counts, progress);
+        return Ok(translated.clone());
+    }
+    let max_retries = store.settings().max_batch_retries;
+    let mut attempts = 0;
+    let translated = loop {
+        attempts += 1;
+        match scheduler
+            .translate_image(
+                options.clone(),
+                filename.to_string(),
+                bytes.clone(),
+                Priority::Low,
+            )
+            .await
+        {
+            Ok(translated) => break Ok(translated),
+            Err(_error) if attempts <= max_retries => {
+                sleep(Duration::from_millis((250 * attempts as u64).min(2_000))).await;
+            }
+            Err(error) => break Err(error.to_string()),
+        }
+    };
+    let translated = match translated {
+        Ok(translated) => {
+            state
+                .cached_batches
+                .insert(batch_id, CachedBatch::Image(translated.clone()));
+            counts.translated += 1;
+            translated
+        }
+        Err(error) => {
+            state.failed_batches.push(FileBatchFailure {
+                id: batch_id,
+                segment_count: 1,
+                attempts,
+                error,
+            });
+            counts.failed += 1;
+            bytes
+        }
+    };
     counts.completed_batches += 1;
     report(counts, progress);
     Ok(translated)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_plain_file(
     store: &AppStore,
     scheduler: &AiScheduler,
@@ -241,6 +406,7 @@ async fn translate_plain_file(
     output_mode: FileOutputMode,
     counts: &mut Counts,
     progress: &ProgressCallback,
+    state: &mut BatchState,
 ) -> Result<Vec<u8>, FileError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| FileError::Message("Only UTF-8 text files are supported".to_string()))?;
@@ -252,12 +418,14 @@ async fn translate_plain_file(
         output_mode,
         counts,
         progress,
+        state,
         |line| !line.trim().is_empty(),
     )
     .await?
     .into_bytes())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_caption(
     store: &AppStore,
     scheduler: &AiScheduler,
@@ -266,6 +434,7 @@ async fn translate_caption(
     output_mode: FileOutputMode,
     counts: &mut Counts,
     progress: &ProgressCallback,
+    state: &mut BatchState,
 ) -> Result<Vec<u8>, FileError> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| FileError::Message("Only UTF-8 caption files are supported".to_string()))?;
@@ -284,6 +453,7 @@ async fn translate_caption(
         output_mode,
         counts,
         progress,
+        state,
         should_translate,
     )
     .await?
@@ -299,6 +469,7 @@ async fn translate_lines<F>(
     output_mode: FileOutputMode,
     counts: &mut Counts,
     progress: &ProgressCallback,
+    state: &mut BatchState,
     should_translate: F,
 ) -> Result<String, FileError>
 where
@@ -327,6 +498,7 @@ where
         output_mode,
         counts,
         progress,
+        state,
     )
     .await?;
     let mut translated = String::with_capacity(text.len());
@@ -343,6 +515,7 @@ where
     Ok(translated)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_csv(
     store: &AppStore,
     scheduler: &AiScheduler,
@@ -351,6 +524,7 @@ async fn translate_csv(
     output_mode: FileOutputMode,
     counts: &mut Counts,
     progress: &ProgressCallback,
+    state: &mut BatchState,
 ) -> Result<Vec<u8>, FileError> {
     let delimiter = if bytes.contains(&b'\t') && !bytes.contains(&b',') {
         b'\t'
@@ -384,6 +558,7 @@ async fn translate_csv(
         output_mode,
         counts,
         progress,
+        state,
     )
     .await?;
     let mut translation_index = 0;
@@ -405,6 +580,7 @@ async fn translate_csv(
         .map_err(|error| FileError::Io(error.into_error()))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_json(
     store: &AppStore,
     scheduler: &AiScheduler,
@@ -413,6 +589,7 @@ async fn translate_json(
     output_mode: FileOutputMode,
     counts: &mut Counts,
     progress: &ProgressCallback,
+    state: &mut BatchState,
 ) -> Result<Vec<u8>, FileError> {
     let mut json: Value = serde_json::from_slice(bytes)?;
     let mut candidates = Vec::new();
@@ -425,6 +602,7 @@ async fn translate_json(
         output_mode,
         counts,
         progress,
+        state,
     )
     .await?;
     let mut translation_index = 0;
@@ -485,6 +663,7 @@ struct PendingPart {
     text: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_fragments(
     store: &AppStore,
     scheduler: &AiScheduler,
@@ -493,8 +672,11 @@ async fn translate_fragments(
     output_mode: FileOutputMode,
     counts: &mut Counts,
     progress: &ProgressCallback,
+    state: &mut BatchState,
 ) -> Result<Vec<String>, FileError> {
-    let maximum = store.settings().max_chunk_chars.max(1);
+    let settings = store.settings();
+    let maximum = settings.max_chunk_chars.max(1);
+    let maximum_segments = settings.max_chunk_segments.max(1);
     let mut planned = Vec::with_capacity(fragments.len());
     let mut pending = Vec::new();
     for source in fragments {
@@ -535,13 +717,18 @@ async fn translate_fragments(
             .collect());
     }
 
-    let mut batches: Vec<Vec<PendingPart>> = Vec::new();
+    let pending_count = pending.len();
+    let batch_base = counts.total_batches;
+    let mut batches: Vec<(usize, Vec<PendingPart>)> = Vec::new();
     let mut current = Vec::new();
     let mut current_chars = 0usize;
     for part in pending {
         let part_chars = part.text.chars().count();
-        if !current.is_empty() && current_chars + part_chars > maximum {
-            batches.push(current);
+        if !current.is_empty()
+            && (current_chars + part_chars > maximum || current.len() >= maximum_segments)
+        {
+            let batch_id = batch_base + batches.len();
+            batches.push((batch_id, current));
             current = Vec::new();
             current_chars = 0;
         }
@@ -549,7 +736,8 @@ async fn translate_fragments(
         current.push(part);
     }
     if !current.is_empty() {
-        batches.push(current);
+        let batch_id = batch_base + batches.len();
+        batches.push((batch_id, current));
     }
     counts.stage = "translating".to_string();
     counts.total_segments += planned
@@ -559,43 +747,142 @@ async fn translate_fragments(
     counts.total_batches += batches.len();
     report(counts, progress);
 
-    let mut results = vec![String::new(); counts.total_segments];
+    let mut results = vec![String::new(); pending_count];
+    let (stream_sender, mut stream_receiver) = mpsc::unbounded_channel();
     let mut jobs = JoinSet::new();
-    for batch in batches {
+    let mut pending_jobs = 0usize;
+    for (batch_id, batch) in batches {
+        let indexes = batch
+            .iter()
+            .map(|part| part.result_index)
+            .collect::<Vec<_>>();
+        let texts = batch
+            .iter()
+            .map(|part| part.text.clone())
+            .collect::<Vec<_>>();
+        let cached = state.cached_batches.get(&batch_id).cloned();
+        if let Some(CachedBatch::Text(translations)) = cached {
+            if translations.len() == indexes.len() {
+                for (index, translation) in indexes.into_iter().zip(translations) {
+                    results[index] = translation;
+                    counts.translated += 1;
+                }
+                counts.completed_batches += 1;
+                report(counts, progress);
+                continue;
+            }
+            state.cached_batches.remove(&batch_id);
+        } else if cached.is_some() {
+            state.cached_batches.remove(&batch_id);
+        }
+
         let scheduler = scheduler.clone();
         let options = options.clone();
+        let stream_sender = stream_sender.clone();
+        let max_retries = settings.max_batch_retries;
+        let batch_segments = indexes.len();
+        pending_jobs += 1;
         jobs.spawn(async move {
-            let indexes = batch
-                .iter()
-                .map(|part| part.result_index)
-                .collect::<Vec<_>>();
-            let texts = batch
-                .iter()
-                .map(|part| part.text.clone())
-                .collect::<Vec<_>>();
-            let translations = scheduler
-                .translate_batch(options, texts, Priority::Low)
-                .await
-                .map_err(|error| FileError::Message(error.to_string()))?;
-            if translations.len() != indexes.len() {
-                return Err(FileError::Message(
-                    "AI returned a different number of translations than requested".to_string(),
-                ));
-            }
-            Ok::<_, FileError>((indexes, translations))
+            let stream_callback: StreamCallback = Arc::new(move |text| {
+                let _ = stream_sender.send((batch_id, batch_segments, text));
+            });
+            let mut attempts = 0usize;
+            let result = loop {
+                attempts += 1;
+                match scheduler
+                    .translate_batch(
+                        options.clone(),
+                        texts.clone(),
+                        Priority::Low,
+                        Some(stream_callback.clone()),
+                    )
+                    .await
+                {
+                    Ok(translations) if translations.len() == texts.len() => {
+                        break Ok(translations)
+                    }
+                    Ok(translations) => {
+                        let error = format!(
+                            "AI returned {} translations for {} input segments",
+                            translations.len(),
+                            texts.len()
+                        );
+                        if attempts > max_retries {
+                            break Err(error);
+                        }
+                    }
+                    Err(error) => {
+                        if attempts > max_retries {
+                            break Err(error.to_string());
+                        }
+                    }
+                }
+                sleep(Duration::from_millis((250 * attempts as u64).min(2_000))).await;
+            };
+            Ok::<_, FileError>((batch_id, indexes, texts, attempts, result))
         });
     }
-    while let Some(result) = jobs.join_next().await {
-        let (indexes, translations) = result.map_err(|error| {
-            FileError::Message(format!("Translation batch task failed: {error}"))
-        })??;
-        for (index, translation) in indexes.into_iter().zip(translations) {
-            results[index] = translation;
-            counts.translated += 1;
+
+    drop(stream_sender);
+    while pending_jobs > 0 {
+        if stream_receiver.is_closed() {
+            let result = jobs.join_next().await.ok_or_else(|| {
+                FileError::Message("Translation batch task ended unexpectedly".to_string())
+            })?;
+            let (batch_id, indexes, texts, attempts, result) = result.map_err(|error| {
+                FileError::Message(format!("Translation batch task failed: {error}"))
+            })??;
+            apply_batch_result(
+                state,
+                counts,
+                progress,
+                batch_id,
+                indexes,
+                texts,
+                attempts,
+                result,
+                &mut results,
+            );
+            pending_jobs -= 1;
+            continue;
         }
-        counts.completed_batches += 1;
-        report(counts, progress);
+        tokio::select! {
+            stream_update = stream_receiver.recv() => {
+                if let Some((batch_id, batch_segments, text)) = stream_update {
+                    counts.streaming_batch = Some(batch_id);
+                    counts.streaming_segments = partial_batch_item_count(&text);
+                    counts.streaming_batch_segments = batch_segments;
+                    counts.streaming_text = Some(stream_preview(&text));
+                    report(counts, progress);
+                }
+            }
+            result = jobs.join_next() => {
+                let result = result.ok_or_else(|| {
+                    FileError::Message("Translation batch task ended unexpectedly".to_string())
+                })?;
+                let (batch_id, indexes, texts, attempts, result) = result.map_err(|error| {
+                    FileError::Message(format!("Translation batch task failed: {error}"))
+                })??;
+                apply_batch_result(
+                    state,
+                    counts,
+                    progress,
+                    batch_id,
+                    indexes,
+                    texts,
+                    attempts,
+                    result,
+                    &mut results,
+                );
+                pending_jobs -= 1;
+            }
+        }
     }
+    counts.streaming_batch = None;
+    counts.streaming_segments = 0;
+    counts.streaming_batch_segments = 0;
+    counts.streaming_text = None;
+    report(counts, progress);
 
     let mut output = Vec::with_capacity(planned.len());
     for fragment in planned {
@@ -616,6 +903,85 @@ async fn translate_fragments(
         output.push(render_fragment(&fragment.source, &translated, output_mode));
     }
     Ok(output)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_batch_result(
+    state: &mut BatchState,
+    counts: &mut Counts,
+    progress: &ProgressCallback,
+    batch_id: usize,
+    indexes: Vec<usize>,
+    texts: Vec<String>,
+    attempts: usize,
+    result: Result<Vec<String>, String>,
+    results: &mut [String],
+) {
+    counts.streaming_batch = None;
+    counts.streaming_segments = 0;
+    counts.streaming_batch_segments = 0;
+    counts.streaming_text = None;
+    match result {
+        Ok(translations) => {
+            for (index, translation) in indexes.iter().copied().zip(&translations) {
+                results[index] = translation.clone();
+                counts.translated += 1;
+            }
+            state
+                .cached_batches
+                .insert(batch_id, CachedBatch::Text(translations));
+        }
+        Err(error) => {
+            for (index, text) in indexes.into_iter().zip(&texts) {
+                results[index] = text.clone();
+            }
+            counts.failed += texts.len();
+            state.failed_batches.push(FileBatchFailure {
+                id: batch_id,
+                segment_count: texts.len(),
+                attempts,
+                error,
+            });
+        }
+    }
+    counts.completed_batches += 1;
+    report(counts, progress);
+}
+
+fn stream_preview(text: &str) -> String {
+    const MAX_STREAM_PREVIEW_CHARS: usize = 4_000;
+    let total = text.chars().count();
+    if total <= MAX_STREAM_PREVIEW_CHARS {
+        text.to_string()
+    } else {
+        text.chars()
+            .skip(total - MAX_STREAM_PREVIEW_CHARS)
+            .collect()
+    }
+}
+
+fn partial_batch_item_count(text: &str) -> usize {
+    let Some(start) = text.find('[') else {
+        return 0;
+    };
+    let mut escaped = false;
+    let mut in_string = false;
+    let mut count = 0;
+    for character in text[start + 1..].chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+                count += 1;
+            }
+        } else if character == '"' {
+            in_string = true;
+        }
+    }
+    count
 }
 
 fn render_fragment(source: &str, translated: &str, output_mode: FileOutputMode) -> String {
@@ -706,6 +1072,7 @@ async fn translate_office(
     kind: OfficeKind,
     counts: &mut Counts,
     progress: &ProgressCallback,
+    state: &mut BatchState,
 ) -> Result<Vec<u8>, FileError> {
     let entries = unpack_office(bytes)?;
     let mut translated_entries = Vec::with_capacity(entries.len());
@@ -726,6 +1093,7 @@ async fn translate_office(
                     b"w:t",
                     counts,
                     progress,
+                    state,
                 )
                 .await?
             }
@@ -740,6 +1108,7 @@ async fn translate_office(
                     b"a:t",
                     counts,
                     progress,
+                    state,
                 )
                 .await?
             }
@@ -754,6 +1123,7 @@ async fn translate_office(
                     b"t",
                     counts,
                     progress,
+                    state,
                 )
                 .await?
             }
@@ -768,12 +1138,15 @@ async fn translate_office(
                     b"t",
                     counts,
                     progress,
+                    state,
                 )
                 .await?
             }
             _ if is_office_image(kind, &name) && provider_supports_images(store, options) => {
-                translate_image_file(store, scheduler, &name, contents, options, counts, progress)
-                    .await?
+                translate_image_file(
+                    store, scheduler, &name, contents, options, counts, progress, state,
+                )
+                .await?
             }
             _ => {
                 if is_office_image(kind, &name) {
@@ -900,6 +1273,7 @@ async fn translate_xml_document(
     text_tag: &[u8],
     counts: &mut Counts,
     progress: &ProgressCallback,
+    state: &mut BatchState,
 ) -> Result<Vec<u8>, FileError> {
     let blocks = extract_xml_blocks(bytes, block_tag, text_tag)?;
     let sources = blocks
@@ -914,6 +1288,7 @@ async fn translate_xml_document(
         output_mode,
         counts,
         progress,
+        state,
     )
     .await?;
     let mut output = Vec::with_capacity(bytes.len());

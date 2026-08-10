@@ -30,6 +30,7 @@ use crate::{
 pub struct ServerState {
     pub store: AppStore,
     pub server_url: String,
+    pub jobs: FileJobManager,
 }
 
 #[derive(Clone)]
@@ -83,7 +84,7 @@ fn api_router(state: ServerState) -> Router {
         store: store.clone(),
         server_url: state.server_url,
         scheduler: AiScheduler::new(store),
-        jobs: FileJobManager::new(),
+        jobs: state.jobs,
     };
     Router::new()
         .route("/api/health", get(health))
@@ -93,6 +94,7 @@ fn api_router(state: ServerState) -> Router {
         .route("/api/file-jobs", get(file_jobs))
         .route("/api/file-jobs/{id}", get(file_job))
         .route("/api/file-jobs/{id}/download", get(download_file_job))
+        .route("/api/file-jobs/{id}/retry", post(retry_file_job))
         .route("/api/history", get(history).delete(clear_history))
         .route("/api/history/{id}", delete(delete_history))
         .route("/api/providers", put(save_provider))
@@ -162,6 +164,7 @@ async fn translate_file(
 ) -> Result<Json<FileJobStatus>, ApiError> {
     let mut file: Option<(String, Vec<u8>)> = None;
     let mut options: Option<TranslateOptions> = None;
+    let mut source_path: Option<String> = None;
     while let Some(field) = multipart
         .next_field()
         .await
@@ -183,6 +186,9 @@ async fn translate_file(
                 let text = field.text().await.map_err(ApiError::bad_request)?;
                 options = Some(serde_json::from_str(&text).map_err(ApiError::bad_request)?);
             }
+            Some("sourcePath") => {
+                source_path = Some(field.text().await.map_err(ApiError::bad_request)?);
+            }
             _ => {}
         }
     }
@@ -191,7 +197,7 @@ async fn translate_file(
         options.ok_or_else(|| ApiError::bad_request("Translation options are required"))?;
     let output_mode = options.output_mode;
     let request = options.into_request();
-    let status = state.jobs.create(&filename, output_mode);
+    let status = state.jobs.create(&filename, output_mode, source_path);
     let job_id = status.id.clone();
     let jobs = state.jobs.clone();
     let store = state.store.clone();
@@ -241,6 +247,30 @@ async fn file_job(
         .get(&id)
         .map(Json)
         .ok_or_else(|| ApiError::not_found("File job was not found"))
+}
+
+async fn retry_file_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<FileJobStatus>, ApiError> {
+    let (status, context) = state.jobs.begin_retry(&id).map_err(ApiError::bad_request)?;
+    let jobs = state.jobs.clone();
+    let store = state.store.clone();
+    let scheduler = state.scheduler.clone();
+    let restore_context = context.clone();
+    let job_id = id.clone();
+    tokio::spawn(async move {
+        let progress_jobs = jobs.clone();
+        let progress_job_id = job_id.clone();
+        let progress: files::ProgressCallback = Arc::new(move |value| {
+            progress_jobs.update_progress(&progress_job_id, value);
+        });
+        match files::retry_failed_batches(&store, &scheduler, context, progress).await {
+            Ok(result) => jobs.complete(&job_id, result),
+            Err(error) => jobs.restore_retry(&job_id, restore_context, error.to_string()),
+        }
+    });
+    Ok(Json(status))
 }
 
 async fn download_file_job(

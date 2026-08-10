@@ -1,8 +1,8 @@
-import { Globe2, Save } from "lucide-react";
+import { FolderOpen, Globe2, Save } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../api";
-import type { AppSettings, BootstrapData } from "../types";
+import { api, isDesktopApp } from "../api";
+import type { AppSettings, BootstrapData, DownloadLocation } from "../types";
 
 export function SettingsPage({ data, onReload }: { data: BootstrapData; onReload: () => Promise<void> }) {
   const { t, i18n } = useTranslation();
@@ -20,6 +20,19 @@ export function SettingsPage({ data, onReload }: { data: BootstrapData; onReload
       setMessage(t("status.saved"));
       await onReload();
     } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+  };
+
+  const chooseCustomDirectory = async () => {
+    if (!isDesktopApp()) return;
+    try {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const selected = await open({ directory: true, multiple: false });
+      if (typeof selected === "string") {
+        setSettings((current) => ({ ...current, customDownloadDirectory: selected }));
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
   return (
@@ -42,9 +55,18 @@ export function SettingsPage({ data, onReload }: { data: BootstrapData; onReload
         <div className="server-url">{data.serverUrl}</div>
       </div>
       <div className="settings-section">
+        <h2><FolderOpen size={18} /> {t("settings.downloads")}</h2>
+        <label className="setting-row"><div><strong>{t("settings.downloadLocation")}</strong><span>{t("settings.downloadLocationHint")}</span></div><select value={settings.downloadLocation} onChange={(event) => setSettings({ ...settings, downloadLocation: event.target.value as DownloadLocation })}><option value="source">{t("settings.sourceFolder")}</option><option value="downloads">{t("settings.systemDownloads")}</option><option value="custom">{t("settings.customFolder")}</option></select></label>
+        {settings.downloadLocation === "custom" && <div className="setting-row"><div><strong>{t("settings.customFolder")}</strong><span>{t("settings.customFolderHint")}</span></div><div className="setting-path-control"><input value={settings.customDownloadDirectory} onChange={(event) => setSettings({ ...settings, customDownloadDirectory: event.target.value })} placeholder={t("settings.customFolderPlaceholder")} /><button className="icon-text-button compact" type="button" onClick={() => void chooseCustomDirectory()} disabled={!isDesktopApp()} title={t("settings.chooseFolder")}><FolderOpen size={16} /> {t("settings.chooseFolder")}</button></div></div>}
+        <label className="setting-row"><div><strong>{t("settings.autoDownload")}</strong><span>{t("settings.autoDownloadHint")}</span></div><span className="setting-toggle"><input type="checkbox" checked={settings.autoDownloadFiles} onChange={(event) => setSettings({ ...settings, autoDownloadFiles: event.target.checked })} /><span>{t("settings.enabledOption")}</span></span></label>
+        <label className="setting-row"><div><strong>{t("settings.askDownload")}</strong><span>{t("settings.askDownloadHint")}</span></div><span className="setting-toggle"><input type="checkbox" checked={settings.askDownloadLocation} onChange={(event) => setSettings({ ...settings, askDownloadLocation: event.target.checked })} /><span>{t("settings.enabledOption")}</span></span></label>
+      </div>
+      <div className="settings-section">
         <h2>{t("settings.chunk")}</h2>
         <label className="setting-row"><div><strong>{t("settings.chunk")}</strong><span>{t("settings.chunkHint")}</span></div><input type="number" min={500} max={50000} step={500} value={settings.maxChunkChars} onChange={(event) => setSettings({ ...settings, maxChunkChars: Number(event.target.value) })} /></label>
+        <label className="setting-row"><div><strong>{t("settings.chunkSegments")}</strong><span>{t("settings.chunkSegmentsHint")}</span></div><input type="number" min={1} max={10000} step={1} value={settings.maxChunkSegments} onChange={(event) => setSettings({ ...settings, maxChunkSegments: Number(event.target.value) })} /></label>
         <label className="setting-row"><div><strong>{t("settings.concurrency")}</strong><span>{t("settings.concurrencyHint")}</span></div><input type="number" min={1} max={32} step={1} value={settings.maxConcurrentAi} onChange={(event) => setSettings({ ...settings, maxConcurrentAi: Number(event.target.value) })} /></label>
+        <label className="setting-row"><div><strong>{t("settings.retries")}</strong><span>{t("settings.retriesHint")}</span></div><input type="number" min={0} max={20} step={1} value={settings.maxBatchRetries} onChange={(event) => setSettings({ ...settings, maxBatchRetries: Number(event.target.value) })} /></label>
         <label className="setting-row"><div><strong>{t("settings.timeout")}</strong><span>{t("settings.timeoutHint")}</span></div><input type="number" min={10} max={3600} step={10} value={settings.aiTimeoutSeconds} onChange={(event) => setSettings({ ...settings, aiTimeoutSeconds: Number(event.target.value) })} /></label>
       </div>
       <div className="settings-version">{t("settings.version")}: v{data.version}</div>

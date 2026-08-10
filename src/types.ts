@@ -45,9 +45,18 @@ export interface AppSettings {
   webHost: string;
   webPort: number;
   maxChunkChars: number;
+  maxChunkSegments: number;
   maxConcurrentAi: number;
+  maxBatchRetries: number;
   aiTimeoutSeconds: number;
+  downloadLocation: DownloadLocation;
+  customDownloadDirectory: string;
+  autoDownloadFiles: boolean;
+  askDownloadLocation: boolean;
+  lastDownloadDirectory: string;
 }
+
+export type DownloadLocation = "source" | "downloads" | "custom";
 
 export interface BootstrapData {
   version: string;
@@ -99,13 +108,28 @@ export interface FileJobStatus {
   stage: string;
   totalSegments: number;
   translatedSegments: number;
+  failedSegments: number;
   skippedSegments: number;
   totalBatches: number;
   completedBatches: number;
+  failedBatches: FileBatchFailure[];
+  streamingBatch?: number;
+  streamingSegments: number;
+  streamingBatchSegments: number;
+  streamingText?: string;
   resultFilename: string;
   mediaType: string;
   error?: string;
   createdAt: string;
+  sourcePath?: string;
+  downloadedPath?: string;
+}
+
+export interface FileBatchFailure {
+  id: number;
+  segmentCount: number;
+  attempts: number;
+  error: string;
 }
 
 export interface TranslateFileOptions extends Omit<TranslateRequest, "text"> {

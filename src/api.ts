@@ -13,8 +13,12 @@ import type {
 
 let apiBase = "";
 
+export function isDesktopApp() {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
 export async function initializeApi() {
-  if (import.meta.env.DEV || !("__TAURI_INTERNALS__" in window)) return;
+  if (import.meta.env.DEV || !isDesktopApp()) return;
   const { invoke } = await import("@tauri-apps/api/core");
   apiBase = await invoke<string>("server_url");
 }
@@ -50,15 +54,22 @@ export const api = {
   history: () => request<HistoryEntry[]>("/history"),
   translate: (payload: TranslateRequest) =>
     request<TranslationResult>("/translate", { method: "POST", body: JSON.stringify(payload) }),
-  translateFile: async (file: File, options: TranslateFileOptions) => {
+  translateFile: async (file: File, options: TranslateFileOptions, sourcePath?: string) => {
     const form = new FormData();
     form.append("file", file);
     form.append("options", JSON.stringify(options));
+    if (sourcePath) form.append("sourcePath", sourcePath);
     return request<FileJobStatus>("/translate-file", { method: "POST", body: form });
   },
   fileJobs: () => request<FileJobStatus[]>("/file-jobs"),
   fileJob: (id: string) => request<FileJobStatus>(`/file-jobs/${encodeURIComponent(id)}`),
+  retryFileJob: (id: string) =>
+    request<FileJobStatus>(`/file-jobs/${encodeURIComponent(id)}/retry`, { method: "POST" }),
   downloadFileJob: (id: string) => requestBlob(`/file-jobs/${encodeURIComponent(id)}/download`),
+  saveFileJob: async (id: string, destination: string) => {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return invoke<FileJobStatus>("save_file_job", { jobId: id, destination });
+  },
   saveProvider: (provider: Provider) =>
     request<Provider>("/providers", { method: "PUT", body: JSON.stringify(provider) }),
   deleteProvider: (id: string) => request<void>(`/providers/${id}`, { method: "DELETE" }),

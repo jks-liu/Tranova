@@ -1,4 +1,4 @@
-use std::{error::Error as StdError, time::Duration};
+use std::{error::Error as StdError, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use reqwest::{
@@ -21,6 +21,8 @@ pub enum AiError {
     #[error("Network request failed: {0}")]
     Request(String),
 }
+
+pub type StreamCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 const AI_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_REQUEST_ATTEMPTS: usize = 3;
@@ -65,6 +67,7 @@ pub async fn translate_batch(
     store: &AppStore,
     request: &TranslateRequest,
     texts: &[String],
+    stream: Option<StreamCallback>,
 ) -> Result<Vec<String>, AiError> {
     if texts.is_empty() {
         return Ok(Vec::new());
@@ -93,9 +96,14 @@ pub async fn translate_batch(
         texts.len(),
         texts.len()
     );
-    let response =
-        translate_with_data_instruction(&data, &provider, &batch_request, Some(&instruction))
-            .await?;
+    let response = translate_with_data_instruction(
+        &data,
+        &provider,
+        &batch_request,
+        Some(&instruction),
+        stream,
+    )
+    .await?;
     parse_batch_response(&response, texts.len())
 }
 
@@ -208,7 +216,7 @@ async fn translate_with_data(
     provider: &Provider,
     request: &TranslateRequest,
 ) -> Result<String, AiError> {
-    translate_with_data_instruction(data, provider, request, None).await
+    translate_with_data_instruction(data, provider, request, None, None).await
 }
 
 async fn translate_with_data_instruction(
@@ -216,6 +224,7 @@ async fn translate_with_data_instruction(
     provider: &Provider,
     request: &TranslateRequest,
     extra_system_instruction: Option<&str>,
+    stream: Option<StreamCallback>,
 ) -> Result<String, AiError> {
     let (mut system, user) = build_messages(data, request);
     if let Some(instruction) = extra_system_instruction {
@@ -224,8 +233,8 @@ async fn translate_with_data_instruction(
     }
     let client = build_client(&data.settings.proxy_url, data.settings.ai_timeout_seconds)?;
     let response = match provider.kind {
-        ProviderKind::Ollama => call_ollama(&client, provider, &system, &user).await?,
-        _ => call_openai_compatible(&client, provider, &system, &user).await?,
+        ProviderKind::Ollama => call_ollama(&client, provider, &system, &user, stream).await?,
+        _ => call_openai_compatible(&client, provider, &system, &user, stream).await?,
     };
     let response = response.trim();
     if response.is_empty() {
@@ -365,6 +374,7 @@ async fn call_openai_compatible(
     provider: &Provider,
     system: &str,
     user: &str,
+    stream: Option<StreamCallback>,
 ) -> Result<String, AiError> {
     let endpoint = if provider.base_url.ends_with("/chat/completions") {
         provider.base_url.clone()
@@ -381,20 +391,18 @@ async fn call_openai_compatible(
             { "role": "user", "content": user }
         ],
         "temperature": 0.2,
-        "stream": false
+        "stream": true
     });
-    let response = send_json_request(
+    send_stream_request(
         client,
         &endpoint,
         &body,
         (!provider.api_key.trim().is_empty()).then_some(provider.api_key.trim()),
-        "OpenAI-compatible request",
+        "OpenAI-compatible",
+        StreamFormat::OpenAi,
+        stream,
     )
-    .await?;
-    let body = parse_provider_json(response, "OpenAI-compatible provider")?;
-    content_from_openai_response(&body).ok_or_else(|| {
-        AiError::Message("Provider response did not contain choices[0].message.content".to_string())
-    })
+    .await
 }
 
 async fn call_ollama(
@@ -402,6 +410,7 @@ async fn call_ollama(
     provider: &Provider,
     system: &str,
     user: &str,
+    stream: Option<StreamCallback>,
 ) -> Result<String, AiError> {
     let endpoint = if provider.base_url.ends_with("/api/chat") {
         provider.base_url.clone()
@@ -414,30 +423,64 @@ async fn call_ollama(
             { "role": "system", "content": system },
             { "role": "user", "content": user }
         ],
-        "stream": false,
+        "stream": true,
         "options": { "temperature": 0.2 }
     });
-    let response = send_json_request(client, &endpoint, &body, None, "Ollama request").await?;
-    let body = parse_provider_json(response, "Ollama")?;
-    body.pointer("/message/content")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| {
-            AiError::Message("Ollama response did not contain message.content".to_string())
-        })
+    send_stream_request(
+        client,
+        &endpoint,
+        &body,
+        None,
+        "Ollama",
+        StreamFormat::Ollama,
+        stream,
+    )
+    .await
 }
 
-async fn send_json_request(
+#[derive(Clone, Copy)]
+enum StreamFormat {
+    OpenAi,
+    Ollama,
+}
+
+async fn send_stream_request(
     client: &Client,
     endpoint: &str,
     body: &Value,
     api_key: Option<&str>,
-    operation: &str,
-) -> Result<ProviderResponse, AiError> {
+    provider_name: &str,
+    format: StreamFormat,
+    stream: Option<StreamCallback>,
+) -> Result<String, AiError> {
     let mut last_error = None;
     for attempt in 1..=MAX_REQUEST_ATTEMPTS {
-        match send_json_attempt(client, endpoint, body, api_key).await {
-            Ok(response) => return Ok(response),
+        match send_stream_attempt(client, endpoint, body, api_key).await {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+                if !status.is_success() {
+                    let body = response.text().await.map_err(|error| {
+                        request_error(&format!("reading {provider_name} error response"), error)
+                    })?;
+                    let error = match parse_provider_json(
+                        ProviderResponse {
+                            status,
+                            headers,
+                            body,
+                        },
+                        provider_name,
+                    ) {
+                        Ok(_) => AiError::Message(format!(
+                            "{provider_name} returned HTTP {}",
+                            status.as_u16()
+                        )),
+                        Err(error) => error,
+                    };
+                    return Err(error);
+                }
+                return read_stream_response(response, format, stream).await;
+            }
             Err(error) if retryable_request_error(&error) && attempt < MAX_REQUEST_ATTEMPTS => {
                 last_error = Some(error);
                 tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
@@ -448,35 +491,191 @@ async fn send_json_request(
                 } else {
                     String::new()
                 };
-                return Err(request_error(&format!("{operation}{attempts}"), error));
+                return Err(request_error(
+                    &format!("{provider_name} streaming request{attempts}"),
+                    error,
+                ));
             }
         }
     }
 
     Err(request_error(
-        &format!("{operation} after {MAX_REQUEST_ATTEMPTS} attempts"),
-        last_error.expect("a request attempt must fail before reaching this point"),
+        &format!("{provider_name} streaming request after {MAX_REQUEST_ATTEMPTS} attempts"),
+        last_error.expect("a streaming request attempt must fail before reaching this point"),
     ))
 }
 
-async fn send_json_attempt(
+async fn send_stream_attempt(
     client: &Client,
     endpoint: &str,
     body: &Value,
     api_key: Option<&str>,
-) -> Result<ProviderResponse, reqwest::Error> {
+) -> Result<reqwest::Response, reqwest::Error> {
     let mut call = client.post(endpoint).json(body);
     if let Some(api_key) = api_key {
         call = call.bearer_auth(api_key);
     }
-    let response = call.send().await?;
-    let status = response.status();
-    let headers = response.headers().clone();
-    let body = response.text().await?;
-    Ok(ProviderResponse {
-        status,
-        headers,
-        body,
+    call.send().await
+}
+
+async fn read_stream_response(
+    mut response: reqwest::Response,
+    format: StreamFormat,
+    stream: Option<StreamCallback>,
+) -> Result<String, AiError> {
+    let mut pending = Vec::new();
+    let mut raw = Vec::new();
+    let mut content = String::new();
+    let mut parse_error = None;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| request_error("reading streaming provider response", error))?
+    {
+        raw.extend_from_slice(&chunk);
+        pending.extend_from_slice(&chunk);
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=newline).collect::<Vec<_>>();
+            if let Err(error) = append_stream_line(&line, format, &mut content, stream.as_ref()) {
+                parse_error.get_or_insert(error);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        if let Err(error) = append_stream_line(&pending, format, &mut content, stream.as_ref()) {
+            parse_error.get_or_insert(error);
+        }
+    }
+    if let Some(error) = parse_error {
+        // Some compatible servers ignore stream=true and may return pretty-printed JSON.
+        if content.is_empty() {
+            if let Ok(body) = std::str::from_utf8(&raw) {
+                let before = content.len();
+                if append_non_streaming_body(body, format, &mut content, stream.as_ref()).is_ok()
+                    && content.len() > before
+                {
+                    return Ok(content);
+                }
+            }
+        }
+        return Err(error);
+    }
+    if content.is_empty() {
+        return Err(AiError::Message(
+            "Streaming provider response did not contain message content".to_string(),
+        ));
+    }
+    Ok(content)
+}
+
+fn append_stream_line(
+    line: &[u8],
+    format: StreamFormat,
+    content: &mut String,
+    stream: Option<&StreamCallback>,
+) -> Result<(), AiError> {
+    let line = std::str::from_utf8(line)
+        .map_err(|error| {
+            AiError::Message(format!(
+                "Streaming provider returned invalid UTF-8: {error}"
+            ))
+        })?
+        .trim();
+    if line.is_empty() || line.starts_with(":") || line.starts_with("event:") {
+        return Ok(());
+    }
+    let payload = match format {
+        StreamFormat::OpenAi => {
+            let Some(payload) = line.strip_prefix("data:") else {
+                return append_non_streaming_body(line, format, content, stream);
+            };
+            let payload = payload.trim();
+            if payload == "[DONE]" || payload.is_empty() {
+                return Ok(());
+            }
+            payload
+        }
+        StreamFormat::Ollama => line,
+    };
+    let value: Value = serde_json::from_str(payload).map_err(|error| {
+        AiError::Message(format!(
+            "Streaming provider returned invalid JSON: {error}; response: {payload}"
+        ))
+    })?;
+    let delta = match format {
+        StreamFormat::OpenAi => value
+            .pointer("/choices/0/delta/content")
+            .and_then(value_text)
+            .or_else(|| {
+                value
+                    .pointer("/choices/0/message/content")
+                    .and_then(value_text)
+            }),
+        StreamFormat::Ollama => value
+            .pointer("/message/content")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    if let Some(delta) = delta {
+        content.push_str(&delta);
+        if let Some(stream) = stream {
+            stream(content.clone());
+        }
+    }
+    Ok(())
+}
+
+fn append_non_streaming_body(
+    line: &str,
+    format: StreamFormat,
+    content: &mut String,
+    stream: Option<&StreamCallback>,
+) -> Result<(), AiError> {
+    let value: Value = serde_json::from_str(line).map_err(|error| {
+        AiError::Message(format!(
+            "Streaming provider returned invalid JSON: {error}; response: {line}"
+        ))
+    })?;
+    append_non_streaming_value(&value, format, content, stream);
+    Ok(())
+}
+
+fn append_non_streaming_value(
+    value: &Value,
+    format: StreamFormat,
+    content: &mut String,
+    stream: Option<&StreamCallback>,
+) {
+    let text = match format {
+        StreamFormat::OpenAi => value
+            .pointer("/choices/0/message/content")
+            .and_then(value_text),
+        StreamFormat::Ollama => value
+            .pointer("/message/content")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    if let Some(text) = text {
+        content.push_str(&text);
+        if let Some(stream) = stream {
+            stream(content.clone());
+        }
+    }
+}
+
+fn value_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        return Some(text.to_string());
+    }
+    value.as_array().map(|items| {
+        items
+            .iter()
+            .filter_map(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| item.get("content").and_then(Value::as_str))
+            })
+            .collect()
     })
 }
 
@@ -549,23 +748,6 @@ fn response_excerpt(body: &str) -> String {
     }
 }
 
-fn content_from_openai_response(body: &Value) -> Option<String> {
-    let content = body.pointer("/choices/0/message/content")?;
-    if let Some(text) = content.as_str() {
-        return Some(text.to_string());
-    }
-    content.as_array().map(|items| {
-        items
-            .iter()
-            .filter_map(|item| {
-                item.get("text")
-                    .and_then(Value::as_str)
-                    .or_else(|| item.get("content").and_then(Value::as_str))
-            })
-            .collect::<String>()
-    })
-}
-
 fn provider_error(body: &Value, status: u16) -> String {
     body.pointer("/error/message")
         .and_then(Value::as_str)
@@ -578,13 +760,16 @@ fn provider_error(body: &Value, status: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_messages, image_format_matches, image_output_format, parse_batch_response,
-        parse_provider_json, ProviderResponse,
+        append_non_streaming_body, append_stream_line, build_messages, image_format_matches,
+        image_output_format, parse_batch_response, parse_provider_json, ProviderResponse,
+        StreamCallback, StreamFormat,
     };
     use crate::models::{
         AppData, Glossary, GlossaryEntry, PromptTemplate, Provider, ProviderKind, TranslateRequest,
     };
     use reqwest::{header::HeaderMap, StatusCode};
+    use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn prompt_includes_every_selected_glossary() {
@@ -635,6 +820,69 @@ mod tests {
             vec!["one", "two"]
         );
         assert!(parse_batch_response(r#"["one"]"#, 2).is_err());
+    }
+
+    #[test]
+    fn openai_sse_accumulates_deltas_and_reports_partial_content() {
+        let updates = Arc::new(Mutex::new(Vec::<String>::new()));
+        let updates_for_callback = updates.clone();
+        let callback: StreamCallback = Arc::new(move |value| {
+            updates_for_callback.lock().unwrap().push(value);
+        });
+        let mut content = String::new();
+        for delta in [r#"["one","#, r#""two"]"#] {
+            let line = format!(
+                "data: {}\n",
+                json!({ "choices": [{ "delta": { "content": delta } }] })
+            );
+            append_stream_line(
+                line.as_bytes(),
+                StreamFormat::OpenAi,
+                &mut content,
+                Some(&callback),
+            )
+            .unwrap();
+        }
+        append_stream_line(
+            b"data: [DONE]\n",
+            StreamFormat::OpenAi,
+            &mut content,
+            Some(&callback),
+        )
+        .unwrap();
+
+        assert_eq!(content, r#"["one","two"]"#);
+        assert_eq!(
+            *updates.lock().unwrap(),
+            vec![r#"["one","#.to_string(), r#"["one","two"]"#.to_string()]
+        );
+    }
+
+    #[test]
+    fn ollama_ndjson_accumulates_message_content() {
+        let mut content = String::new();
+        for value in [
+            json!({ "message": { "content": "[\"one\",\"" } }),
+            json!({ "message": { "content": "two\"]" } }),
+            json!({ "done": true }),
+        ] {
+            let line = format!("{}\n", value);
+            append_stream_line(line.as_bytes(), StreamFormat::Ollama, &mut content, None).unwrap();
+        }
+        assert_eq!(content, r#"["one","two"]"#);
+    }
+
+    #[test]
+    fn pretty_printed_non_streaming_json_is_supported_as_fallback() {
+        let mut content = String::new();
+        append_non_streaming_body(
+            "{\n  \"choices\": [{\n    \"message\": {\"content\": \"译文\"}\n  }]\n}",
+            StreamFormat::OpenAi,
+            &mut content,
+            None,
+        )
+        .unwrap();
+        assert_eq!(content, "译文");
     }
 
     #[test]

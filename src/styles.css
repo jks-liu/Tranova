@@ -99,8 +99,17 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
 .progress-fill { height: 100%; min-width: 0; background: #1c7c67; border-radius: inherit; transition: width .25s ease; }
 .file-job-meta { display: flex; flex-wrap: wrap; gap: 7px 15px; margin-top: 9px; color: #687881; font-size: 12px; }
 .file-job-error { margin-top: 9px; color: #8b382e; font-size: 12px; line-height: 1.45; }
+.file-job-partial { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 10px; color: #9a5a2b; font-size: 12px; }
+.file-job-stream { margin-top: 10px; padding: 9px 10px; background: #f5f8f7; border: 1px solid #d9e7e2; border-radius: 4px; color: #315b52; font-size: 12px; }
+.file-job-stream pre { max-height: 120px; margin: 6px 0 0; overflow: auto; white-space: pre-wrap; word-break: break-word; font: inherit; line-height: 1.45; }
 .file-job-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; }
-.file-job-actions .muted { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.download-info { min-width: 0; display: grid; gap: 3px; }
+.download-info .muted, .download-path { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.download-path { color: #718088; font-size: 12px; max-width: min(560px, 42vw); }
+.download-status { display: inline-flex; align-items: center; gap: 6px; color: #b75938; font-size: 13px; font-weight: 600; }
+.download-status.complete { color: #176b5a; }
+.download-actions { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 7px; }
+.spin-icon { animation: spin .8s linear infinite; }
 
 .item-list { display: grid; gap: 9px; }
 .list-item { min-height: 74px; display: flex; align-items: center; gap: 13px; background: #fff; border: 1px solid #d3dde1; border-radius: 6px; padding: 11px 13px; }
@@ -151,6 +160,10 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
 .setting-row strong, .setting-row span { display: block; }
 .setting-row strong { font-size: 13px; }
 .setting-row span { margin-top: 4px; color: #718088; font-size: 12px; line-height: 1.4; }
+.setting-path-control { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.setting-path-control input { min-width: 0; flex: 1; }
+.setting-toggle { display: inline-flex; align-items: center; gap: 8px; margin-top: 0 !important; color: #33454f !important; font-size: 13px !important; font-weight: 500; }
+.setting-toggle input { width: 16px; height: 16px; margin: 0; accent-color: #1c7c67; }
 .server-url { margin: 0 16px 14px; background: #f0f5f4; color: #176b5a; border: 1px solid #d0e5da; border-radius: 4px; padding: 9px 10px; font: 12px ui-monospace, SFMono-Regular, Consolas, monospace; }
 .settings-version { color: #718088; font-size: 12px; margin: 6px 0 -2px; }
 .alert { display: flex; align-items: center; gap: 7px; border-radius: 5px; padding: 10px 12px; margin: -8px 0 16px; font-size: 13px; }
@@ -201,7 +214,11 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
   .file-output-options { justify-content: stretch; }
   .file-output-options label { width: 100%; }
   .file-job-heading, .file-job-actions { align-items: flex-start; flex-direction: column; }
-  .file-job-actions .secondary-button { width: 100%; }
+  .file-job-partial { align-items: flex-start; flex-direction: column; }
+  .download-actions { width: 100%; justify-content: flex-start; }
+  .download-actions .secondary-button { flex: 1; }
+  .download-path { max-width: 100%; }
+  .setting-path-control { align-items: stretch; flex-direction: column; }
   .form-grid.two-columns { grid-template-columns: 1fr; }
   .form-grid .full { grid-column: auto; }
   .modal-backdrop { padding: 10px; }
