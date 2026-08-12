@@ -1,5 +1,6 @@
 use std::{io, path::PathBuf, sync::Arc};
 
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
     http::{header, HeaderValue, Method, StatusCode},
@@ -7,8 +8,10 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::{mpsc, Semaphore};
+use tokio_stream::wrappers::UnboundedReceiverStream;
 use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
@@ -19,8 +22,8 @@ use crate::{
     ai, files,
     jobs::FileJobManager,
     models::{
-        AppData, AppSettings, FileJobStatus, Glossary, HistoryEntry, PromptTemplate, Provider,
-        TranslateOptions, TranslateRequest, TranslationResult,
+        AppData, AppSettings, FileJobStatus, Glossary, HistoryEntry, LogsData, PromptTemplate,
+        Provider, ProviderModel, TranslateOptions, TranslateRequest, TranslationResult,
     },
     scheduler::{AiScheduler, Priority},
     store::AppStore,
@@ -39,6 +42,7 @@ struct ApiState {
     server_url: String,
     scheduler: AiScheduler,
     jobs: FileJobManager,
+    file_queue: Arc<Semaphore>,
 }
 
 #[derive(Serialize)]
@@ -50,7 +54,16 @@ struct BootstrapResponse {
     prompts: Vec<PromptTemplate>,
     settings: AppSettings,
     history: Vec<HistoryEntry>,
+    logs: LogsData,
     server_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelDiscoveryRequest {
+    base_url: String,
+    #[serde(default)]
+    api_key: String,
 }
 
 #[derive(Serialize)]
@@ -85,14 +98,17 @@ fn api_router(state: ServerState) -> Router {
         server_url: state.server_url,
         scheduler: AiScheduler::new(store),
         jobs: state.jobs,
+        file_queue: Arc::new(Semaphore::new(1)),
     };
     Router::new()
         .route("/api/health", get(health))
         .route("/api/bootstrap", get(bootstrap))
         .route("/api/translate", post(translate))
+        .route("/api/translate-stream", post(translate_stream))
         .route("/api/translate-file", post(translate_file))
         .route("/api/file-jobs", get(file_jobs))
         .route("/api/file-jobs/{id}", get(file_job))
+        .route("/api/file-jobs/{id}/cancel", post(cancel_file_job))
         .route("/api/file-jobs/{id}/download", get(download_file_job))
         .route("/api/file-jobs/{id}/retry", post(retry_file_job))
         .route("/api/history", get(history).delete(clear_history))
@@ -100,11 +116,13 @@ fn api_router(state: ServerState) -> Router {
         .route("/api/providers", put(save_provider))
         .route("/api/providers/{id}", delete(delete_provider))
         .route("/api/providers/{id}/test", post(test_provider))
+        .route("/api/providers/models", post(discover_models))
         .route("/api/glossaries", put(save_glossary))
         .route("/api/glossaries/{id}", delete(delete_glossary))
         .route("/api/prompts", put(save_prompt))
         .route("/api/prompts/{id}", delete(delete_prompt))
         .route("/api/settings", put(save_settings))
+        .route("/api/logs", get(logs))
         .route("/api/import/{kind}", post(import_data))
         .layer(DefaultBodyLimit::max(75 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
@@ -130,7 +148,9 @@ async fn bootstrap(State(state): State<ApiState>) -> Json<BootstrapResponse> {
         prompts,
         settings,
         history,
+        ..
     } = state.store.snapshot();
+    let (system, conversations) = state.store.logs();
     Json(BootstrapResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
         providers,
@@ -138,6 +158,10 @@ async fn bootstrap(State(state): State<ApiState>) -> Json<BootstrapResponse> {
         prompts,
         settings,
         history,
+        logs: LogsData {
+            system,
+            conversations,
+        },
         server_url: state.server_url,
     })
 }
@@ -156,6 +180,48 @@ async fn translate(
         .add_history(history_for_text(&request, &result))
         .map_err(ApiError::from_io)?;
     Ok(Json(result))
+}
+
+async fn translate_stream(
+    State(state): State<ApiState>,
+    Json(request): Json<TranslateRequest>,
+) -> impl IntoResponse {
+    let (sender, receiver) = mpsc::unbounded_channel::<Result<Event, std::convert::Infallible>>();
+    let scheduler = state.scheduler.clone();
+    let store = state.store.clone();
+    tokio::spawn(async move {
+        let stream_sender = sender.clone();
+        let callback: ai::StreamCallback = Arc::new(move |text| {
+            let payload = serde_json::json!({ "text": text });
+            if let Ok(data) = serde_json::to_string(&payload) {
+                let _ = stream_sender.send(Ok(Event::default().event("delta").data(data)));
+            }
+        });
+        match scheduler
+            .translate_with_stream(request.clone(), Priority::High, Some(callback))
+            .await
+        {
+            Ok(result) => {
+                if let Err(error) = store.add_history(history_for_text(&request, &result)) {
+                    let payload = serde_json::json!({ "error": error.to_string() });
+                    let _ = sender.send(Ok(Event::default()
+                        .event("error")
+                        .data(payload.to_string())));
+                } else {
+                    let payload = serde_json::json!({ "result": result });
+                    let _ =
+                        sender.send(Ok(Event::default().event("done").data(payload.to_string())));
+                }
+            }
+            Err(error) => {
+                let payload = serde_json::json!({ "error": error.to_string() });
+                let _ = sender.send(Ok(Event::default()
+                    .event("error")
+                    .data(payload.to_string())));
+            }
+        }
+    });
+    Sse::new(UnboundedReceiverStream::new(receiver)).keep_alive(KeepAlive::default())
 }
 
 async fn translate_file(
@@ -199,17 +265,39 @@ async fn translate_file(
     let request = options.into_request();
     let status = state.jobs.create(&filename, output_mode, source_path);
     let job_id = status.id.clone();
+    state.store.add_system_log(
+        "info",
+        "file",
+        format!("Queued file job {} for {}", job_id, filename),
+    );
     let jobs = state.jobs.clone();
     let store = state.store.clone();
     let scheduler = state.scheduler.clone();
+    let file_queue = state.file_queue.clone();
     tokio::spawn(async move {
+        let cancel = match jobs.cancellation_token(&job_id) {
+            Some(cancel) => cancel,
+            None => return,
+        };
+        let permit = tokio::select! {
+            permit = file_queue.acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    jobs.fail(&job_id, "File translation queue is unavailable".to_string());
+                    store.add_system_log("error", "file", format!("File queue unavailable for job {job_id}"));
+                    return;
+                }
+            },
+            _ = cancel.cancelled() => return,
+        };
         jobs.mark_processing(&job_id);
+        store.add_system_log("debug", "file", format!("Started file job {job_id}"));
         let progress_jobs = jobs.clone();
         let progress_job_id = job_id.clone();
         let progress: files::ProgressCallback = Arc::new(move |value| {
             progress_jobs.update_progress(&progress_job_id, value);
         });
-        match files::translate_file(
+        match files::translate_file_with_cancel(
             &store,
             &scheduler,
             &filename,
@@ -217,6 +305,7 @@ async fn translate_file(
             request.clone(),
             output_mode,
             progress,
+            cancel.clone(),
         )
         .await
         {
@@ -224,12 +313,30 @@ async fn translate_file(
                 let history_result = history_for_file(&request, &result.filename);
                 if let Err(error) = store.add_history(history_result) {
                     jobs.fail(&job_id, error.to_string());
+                    store.add_system_log(
+                        "error",
+                        "file",
+                        format!("Could not save history for file job {job_id}: {error}"),
+                    );
                 } else {
                     jobs.complete(&job_id, result);
+                    store.add_system_log("info", "file", format!("Completed file job {job_id}"));
                 }
             }
-            Err(error) => jobs.fail(&job_id, error.to_string()),
+            Err(files::FileError::Cancelled) => {
+                let _ = jobs.cancel(&job_id);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                jobs.fail(&job_id, message.clone());
+                store.add_system_log(
+                    "error",
+                    "file",
+                    format!("File job {job_id} failed: {message}"),
+                );
+            }
         }
+        drop(permit);
     });
     Ok(Json(status))
 }
@@ -249,26 +356,76 @@ async fn file_job(
         .ok_or_else(|| ApiError::not_found("File job was not found"))
 }
 
+async fn cancel_file_job(
+    State(state): State<ApiState>,
+    Path(id): Path<String>,
+) -> Result<Json<FileJobStatus>, ApiError> {
+    let status = state.jobs.cancel(&id).map_err(ApiError::bad_request)?;
+    state
+        .store
+        .add_system_log("info", "file", format!("Cancelled file job {id}"));
+    Ok(Json(status))
+}
+
 async fn retry_file_job(
     State(state): State<ApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<FileJobStatus>, ApiError> {
     let (status, context) = state.jobs.begin_retry(&id).map_err(ApiError::bad_request)?;
+    state.store.add_system_log(
+        "info",
+        "file",
+        format!("Retrying failed batches for file job {id}"),
+    );
     let jobs = state.jobs.clone();
     let store = state.store.clone();
     let scheduler = state.scheduler.clone();
+    let file_queue = state.file_queue.clone();
     let restore_context = context.clone();
+    let queue_restore_context = restore_context.clone();
     let job_id = id.clone();
     tokio::spawn(async move {
+        let cancel = match jobs.cancellation_token(&job_id) {
+            Some(cancel) => cancel,
+            None => return,
+        };
+        let permit = tokio::select! {
+            permit = file_queue.acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => {
+                    jobs.restore_retry(
+                        &job_id,
+                        queue_restore_context,
+                        "File translation queue is unavailable".to_string(),
+                    );
+                    return;
+                }
+            },
+            _ = cancel.cancelled() => return,
+        };
         let progress_jobs = jobs.clone();
         let progress_job_id = job_id.clone();
         let progress: files::ProgressCallback = Arc::new(move |value| {
             progress_jobs.update_progress(&progress_job_id, value);
         });
-        match files::retry_failed_batches(&store, &scheduler, context, progress).await {
+        match files::retry_failed_batches_with_cancel(&store, &scheduler, context, progress, cancel)
+            .await
+        {
             Ok(result) => jobs.complete(&job_id, result),
-            Err(error) => jobs.restore_retry(&job_id, restore_context, error.to_string()),
+            Err(files::FileError::Cancelled) => {
+                let _ = jobs.cancel(&job_id);
+            }
+            Err(error) => {
+                let message = error.to_string();
+                jobs.restore_retry(&job_id, restore_context, message.clone());
+                store.add_system_log(
+                    "error",
+                    "file",
+                    format!("Retry failed for file job {job_id}: {message}"),
+                );
+            }
         }
+        drop(permit);
     });
     Ok(Json(status))
 }
@@ -345,6 +502,14 @@ async fn clear_history(State(state): State<ApiState>) -> Result<StatusCode, ApiE
 
 async fn history(State(state): State<ApiState>) -> Json<Vec<HistoryEntry>> {
     Json(state.store.snapshot().history)
+}
+
+async fn logs(State(state): State<ApiState>) -> Json<LogsData> {
+    let (system, conversations) = state.store.logs();
+    Json(LogsData {
+        system,
+        conversations,
+    })
 }
 
 fn history_id() -> String {
@@ -436,6 +601,9 @@ async fn test_provider(
         provider_id: id,
         prompt_id: None,
         glossary_ids: Vec::new(),
+        reasoning_effort: "none".to_string(),
+        summarize: false,
+        context_summary: None,
     };
     state
         .scheduler
@@ -445,6 +613,32 @@ async fn test_provider(
     Ok(Json(MessageResponse {
         message: format!("{} responded successfully", provider.name),
     }))
+}
+
+async fn discover_models(
+    State(state): State<ApiState>,
+    Json(request): Json<ModelDiscoveryRequest>,
+) -> Result<Json<Vec<ProviderModel>>, ApiError> {
+    if request.base_url.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "An OpenAI-compatible API base URL is required",
+        ));
+    }
+    let settings = state.store.settings();
+    let models = ai::list_models(
+        &request.base_url,
+        &request.api_key,
+        &settings.proxy_url,
+        settings.ai_timeout_seconds,
+    )
+    .await
+    .map_err(ApiError::from_ai)?;
+    state.store.add_system_log(
+        "info",
+        "provider",
+        format!("Discovered {} models", models.len()),
+    );
+    Ok(Json(models))
 }
 
 async fn save_glossary(
@@ -491,12 +685,14 @@ async fn save_settings(
     State(state): State<ApiState>,
     Json(settings): Json<AppSettings>,
 ) -> Result<Json<AppSettings>, ApiError> {
-    Ok(Json(
-        state
-            .store
-            .save_settings(settings)
-            .map_err(ApiError::from_io)?,
-    ))
+    let settings = state
+        .store
+        .save_settings(settings)
+        .map_err(ApiError::from_io)?;
+    state
+        .store
+        .add_system_log("info", "settings", "Settings updated");
+    Ok(Json(settings))
 }
 
 async fn import_data(
@@ -521,6 +717,7 @@ async fn import_data(
         prompts,
         settings,
         history,
+        ..
     } = state.store.snapshot();
     Ok(Json(BootstrapResponse {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -529,6 +726,13 @@ async fn import_data(
         prompts,
         settings,
         history,
+        logs: {
+            let (system, conversations) = state.store.logs();
+            LogsData {
+                system,
+                conversations,
+            }
+        },
         server_url: state.server_url,
     }))
 }

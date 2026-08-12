@@ -1,18 +1,19 @@
 import type { ReactNode } from "react";
-import { Bot, FileText, History, Languages, Library, Menu, Settings, Sparkles, X } from "lucide-react";
+import { Bot, Bug, FileText, History, Languages, Library, Menu, Settings, Sparkles, X } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 
-export type View = "translate" | "files" | "history" | "glossaries" | "prompts" | "providers" | "settings";
+export type View = "translate" | "files" | "history" | "glossaries" | "prompts" | "providers" | "settings" | "logs";
 
 interface LayoutProps {
   view: View;
   onViewChange: (view: View) => void;
   children: ReactNode;
   connected: boolean;
+  showLogs: boolean;
 }
 
-export function Layout({ view, onViewChange, children, connected }: LayoutProps) {
+export function Layout({ view, onViewChange, children, connected, showLogs }: LayoutProps) {
   const { t } = useTranslation();
   const [mobileOpen, setMobileOpen] = useState(false);
   const items: Array<{ id: View; icon: typeof Languages; label: string }> = [
@@ -23,6 +24,7 @@ export function Layout({ view, onViewChange, children, connected }: LayoutProps)
     { id: "prompts", icon: Sparkles, label: t("nav.prompts") },
     { id: "providers", icon: Bot, label: t("nav.providers") },
     { id: "settings", icon: Settings, label: t("nav.settings") },
+    ...(showLogs ? [{ id: "logs" as View, icon: Bug, label: t("nav.logs") }] : []),
   ];
 
   const select = (next: View) => {

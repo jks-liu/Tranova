@@ -1,6 +1,6 @@
 import { ArrowLeftRight } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import type { Glossary, PromptTemplate, Provider } from "../types";
+import type { Glossary, PromptTemplate, Provider, ReasoningEffort } from "../types";
 
 const LANGUAGES = ["en", "zh", "ja", "ko", "fr", "de", "es", "ru"];
 
@@ -10,6 +10,7 @@ export interface TranslationOptionsValue {
   providerId: string;
   promptId: string;
   glossaryIds: string[];
+  reasoningEffort: ReasoningEffort;
 }
 
 interface TranslationOptionsProps {
@@ -69,6 +70,15 @@ export function TranslationOptions({ value, onChange, providers, prompts, glossa
         <select value={value.promptId} onChange={(event) => update({ promptId: event.target.value })}>
           <option value="">{t("common.none")}</option>
           {prompts.map((prompt) => <option key={prompt.id} value={prompt.id}>{prompt.name}</option>)}
+        </select>
+      </label>
+      <label>
+        <span>{t("translate.reasoning")}</span>
+        <select value={value.reasoningEffort} onChange={(event) => update({ reasoningEffort: event.target.value as ReasoningEffort })}>
+          <option value="none">{t("translate.reasoningNone")}</option>
+          <option value="low">{t("translate.reasoningLow")}</option>
+          <option value="medium">{t("translate.reasoningMedium")}</option>
+          <option value="high">{t("translate.reasoningHigh")}</option>
         </select>
       </label>
       <fieldset className="glossary-picker">

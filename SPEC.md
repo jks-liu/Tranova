@@ -21,15 +21,7 @@
         - 成熟且大量使用的库：使用
 - 允许用户设置代理（http（https）或socks5（socks5h））
 - 软件需要i18n，请先支持英语和中文
-- 支持的AI
-    * 在线AI
-        - openai
-        - deepseek
-        - 豆包
-    * 本地AI
-        - llama.cpp
-        - LLM Studio
-        - Ollama
+- AI provider仅支持OpenAI Responses API兼容地址；在线服务和本地运行时（如OpenAI、DeepSeek、豆包、llama.cpp、LM Studio、Ollama）通过填写各自的兼容接口基础地址使用。
 - 支持Windows，Linux，Mac。如果可以的话，也请为手机打包（无需web功能），如果无法实现或实现复杂就算了。
 
 

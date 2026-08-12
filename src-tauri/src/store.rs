@@ -7,7 +7,10 @@ use std::{
 use directories::ProjectDirs;
 use parking_lot::RwLock;
 
-use crate::models::{AppData, AppSettings, Glossary, HistoryEntry, PromptTemplate, Provider};
+use crate::models::{
+    AiConversationLog, AppData, AppSettings, Glossary, HistoryEntry, PromptTemplate, Provider,
+    SystemLogEntry,
+};
 
 #[derive(Clone)]
 pub struct AppStore {
@@ -59,6 +62,53 @@ impl AppStore {
         self.inner.data.read().settings.clone()
     }
 
+    pub fn provider(&self, id: &str) -> Option<Provider> {
+        self.inner
+            .data
+            .read()
+            .providers
+            .iter()
+            .find(|provider| provider.id == id)
+            .cloned()
+    }
+
+    pub fn logs(&self) -> (Vec<SystemLogEntry>, Vec<AiConversationLog>) {
+        let data = self.inner.data.read();
+        (data.system_logs.clone(), data.ai_conversations.clone())
+    }
+
+    pub fn add_system_log(&self, level: &str, scope: &str, message: impl Into<String>) {
+        let message = message.into();
+        let mut data = self.inner.data.write();
+        if !logging_enabled(&data.settings, level) {
+            return;
+        }
+        data.system_logs.insert(
+            0,
+            SystemLogEntry {
+                id: log_id(),
+                timestamp: unix_timestamp_millis(),
+                level: normalize_log_level(level),
+                scope: scope.trim().to_string(),
+                message,
+            },
+        );
+        data.system_logs.truncate(500);
+        drop(data);
+        let _ = self.persist();
+    }
+
+    pub fn add_ai_conversation(&self, entry: AiConversationLog) {
+        let mut data = self.inner.data.write();
+        if !data.settings.logging_enabled {
+            return;
+        }
+        data.ai_conversations.insert(0, entry);
+        data.ai_conversations.truncate(200);
+        drop(data);
+        let _ = self.persist();
+    }
+
     pub fn add_history(&self, mut entry: HistoryEntry) -> Result<HistoryEntry, io::Error> {
         if entry.id.trim().is_empty()
             || entry.source_language.trim().is_empty()
@@ -98,6 +148,11 @@ impl AppStore {
         upsert(&mut data.providers, provider.clone(), |value| &value.id);
         drop(data);
         self.persist()?;
+        self.add_system_log(
+            "info",
+            "provider",
+            format!("Saved provider {}", provider.name),
+        );
         Ok(provider)
     }
 
@@ -185,11 +240,8 @@ impl AppStore {
                 "Web port must be between 1024 and 65535",
             ));
         }
-        settings.max_chunk_chars = settings.max_chunk_chars.clamp(500, 50_000);
-        settings.max_chunk_segments = settings.max_chunk_segments.clamp(1, 10_000);
-        settings.max_concurrent_ai = settings.max_concurrent_ai.clamp(1, 32);
-        settings.max_batch_retries = settings.max_batch_retries.min(20);
         settings.ai_timeout_seconds = settings.ai_timeout_seconds.clamp(10, 3_600);
+        settings.log_level = normalize_log_level(&settings.log_level);
         settings.custom_download_directory = settings.custom_download_directory.trim().to_string();
         settings.last_download_directory = settings.last_download_directory.trim().to_string();
         self.inner.data.write().settings = settings.clone();
@@ -246,6 +298,9 @@ fn validate_provider(mut provider: Provider) -> Result<Provider, io::Error> {
     provider.name = provider.name.trim().to_string();
     provider.base_url = provider.base_url.trim().trim_end_matches('/').to_string();
     provider.model = provider.model.trim().to_string();
+    provider.context_size = provider.context_size.clamp(1_024, 2_000_000);
+    provider.max_segments = provider.max_segments.clamp(1, 1_024);
+    provider.max_concurrent = provider.max_concurrent.clamp(1, 64);
     if provider.id.is_empty()
         || provider.name.is_empty()
         || provider.base_url.is_empty()
@@ -263,6 +318,51 @@ fn validate_provider(mut provider: Provider) -> Result<Provider, io::Error> {
         ));
     }
     Ok(provider)
+}
+
+fn normalize_log_level(level: &str) -> String {
+    match level.trim().to_ascii_lowercase().as_str() {
+        "debug" => "debug".to_string(),
+        "warn" => "warn".to_string(),
+        "error" => "error".to_string(),
+        _ => "info".to_string(),
+    }
+}
+
+fn logging_enabled(settings: &AppSettings, level: &str) -> bool {
+    if !settings.logging_enabled {
+        return false;
+    }
+    let rank = |value: &str| match value {
+        "debug" => 0,
+        "info" => 1,
+        "warn" => 2,
+        "error" => 3,
+        _ => 1,
+    };
+    rank(level) >= rank(&settings.log_level)
+}
+
+fn log_id() -> String {
+    format!("log-{}-{}", unix_timestamp_nanos(), std::process::id())
+}
+
+fn unix_timestamp_millis() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .to_string()
+}
+
+fn unix_timestamp_nanos() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .to_string()
 }
 
 fn upsert<T, F>(items: &mut Vec<T>, item: T, key: F)

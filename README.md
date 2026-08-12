@@ -8,12 +8,14 @@ Tranova is a Tauri-based AI translation studio for text and documents. The deskt
 - Preset or custom source and target languages, including a one-click language swap.
 - Persistent translation history shared by the desktop app and local Web interface.
 - Import and export of prompts and glossaries as JSON.
-- Cloud AI providers: OpenAI, DeepSeek and Doubao.
-- Local AI providers: llama.cpp, LM Studio and Ollama.
+- AI providers use the OpenAI Responses API shape. Cloud services and local runtimes such as Ollama, llama.cpp and LM Studio can be configured by entering their OpenAI-compatible base URL.
+- Provider models define their context size, maximum segments per batch, maximum concurrent requests and whether the model is reserved for text translation.
 - HTTP, HTTPS, SOCKS5 and SOCKS5H proxy support.
 - English and Simplified Chinese interfaces.
-- Document translation for DOCX, PPTX, XLSX, TXT, Markdown, HTML, CSV, JSON, SRT and VTT.
-- Image translation for PNG, JPG and WebP, including images embedded in Office documents, when the configured AI provider supports image editing and returns `data[0].b64_json`.
+- Streaming text and file translation with selectable reasoning effort, optional document summaries, cancellation and queued file jobs.
+- Document translation for PDF, DOCX, PPTX, XLSX, TXT, Markdown, HTML, CSV, JSON, SRT and VTT.
+- Optional system and AI conversation logs with configurable minimum log level.
+- Image translation for PNG, JPG and WebP, including images embedded in Office documents, when the configured Responses API provider supports image input and the `image_generation` tool.
 - Local-only Web access with the same React interface and Rust API used by the desktop app.
 
 Office Open XML documents are unpacked locally. Tranova extracts paragraph or text-block content, translates it, replaces the original text, and writes a new document while retaining the package structure and formatting data. Images are left unchanged unless image support is explicitly enabled for the selected provider.
@@ -137,7 +139,7 @@ The browser installation command is only needed once per machine. If Chromium is
 
 ## Configuration and data
 
-Configure at least one enabled AI provider before translating. Provider API keys and all application data are stored in the current user's platform data directory and are never sent to the Tranova Web frontend except through the local loopback service. Web binding is restricted to loopback addresses (`127.0.0.1` or `::1`) so another device cannot read the local configuration.
+Configure at least one enabled AI provider before translating. Use a base URL that exposes the Responses API and enter the model's context size manually when model discovery does not report it. Provider API keys and all application data are stored in the current user's platform data directory and are never sent to the Tranova Web frontend except through the local loopback service. Web binding is restricted to loopback addresses (`127.0.0.1` or `::1`) so another device cannot read the local configuration.
 
 Changes to the Web listening address or port take effect after restarting Tranova. The default prompt can be edited but is retained if deletion is requested, ensuring a usable translation instruction is always available.
 

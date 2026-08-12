@@ -1,4 +1,4 @@
-import { Download, ExternalLink, FileText, FolderOpen, LoaderCircle, RefreshCw, UploadCloud } from "lucide-react";
+import { Ban, Download, ExternalLink, FileText, FolderOpen, LoaderCircle, RefreshCw, UploadCloud } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, isDesktopApp } from "../api";
@@ -12,17 +12,23 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
   const defaultProvider = useMemo(() => data.providers.find((provider) => provider.enabled)?.id || "", [data.providers]);
   const [options, setOptions] = useState<TranslationOptionsValue>(() => readOptions(defaultProvider, data.prompts[0]?.id || ""));
   const [outputMode, setOutputMode] = useState<FileOutputMode>(() => readOutputMode());
+  const [summarize, setSummarize] = useState(() => readSummarize());
   const [file, setFile] = useState<File | null>(null);
   const [sourcePath, setSourcePath] = useState("");
   const [jobs, setJobs] = useState<FileJobStatus[]>([]);
   const [submitting, setSubmitting] = useState(false);
   const [downloadingId, setDownloadingId] = useState("");
   const [retryingId, setRetryingId] = useState("");
+  const [cancellingId, setCancellingId] = useState("");
   const [browserDownloadedIds, setBrowserDownloadedIds] = useState<Set<string>>(() => new Set());
   const [error, setError] = useState("");
   const knownStates = useRef(new Map<string, FileJobStatus["state"]>());
   const autoDownloadedIds = useRef(readAutoDownloadedIds());
   const autoDownloadingIds = useRef(new Set<string>());
+
+  useEffect(() => {
+    localStorage.setItem("tranova-file-summarize", String(summarize));
+  }, [summarize]);
 
   const choose = useCallback((next: File | undefined, nextSourcePath = "") => {
     if (next) {
@@ -165,6 +171,7 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
         ...options,
         promptId: options.promptId || undefined,
         outputMode,
+        summarize,
       }, sourcePath || undefined);
       knownStates.current.set(job.id, job.state);
       setJobs((current) => [job, ...current.filter((item) => item.id !== job.id)]);
@@ -175,6 +182,20 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  const cancelJob = async (job: FileJobStatus) => {
+    if (job.state !== "queued" && job.state !== "processing") return;
+    setCancellingId(job.id);
+    setError("");
+    try {
+      const next = await api.cancelFileJob(job.id);
+      setJobs((current) => current.map((item) => item.id === next.id ? next : item));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setCancellingId("");
     }
   };
 
@@ -195,8 +216,7 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
   const openDownloadedFile = async (job: FileJobStatus) => {
     if (!isDesktopApp() || !job.downloadedPath) return;
     try {
-      const { openPath } = await import("@tauri-apps/plugin-opener");
-      await openPath(job.downloadedPath);
+      await api.openPath(job.downloadedPath);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -206,8 +226,7 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
     if (!isDesktopApp() || !job.downloadedPath) return;
     try {
       const { dirname } = await import("@tauri-apps/api/path");
-      const { openPath } = await import("@tauri-apps/plugin-opener");
-      await openPath(await dirname(job.downloadedPath));
+      await api.openPath(await dirname(job.downloadedPath));
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -230,6 +249,10 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
             <option value="bilingual">{t("files.bilingual")}</option>
           </select>
         </label>
+        <label className="check-row file-summary-toggle">
+          <input type="checkbox" checked={summarize} onChange={(event) => setSummarize(event.target.checked)} />
+          <span>{t("files.summarize")}</span>
+        </label>
       </div>
       <button
         className={`drop-zone ${file ? "has-file" : ""}`}
@@ -242,7 +265,7 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
         <strong>{file?.name || t("files.drop")}</strong>
         <span>{file ? `${(file.size / 1024).toFixed(1)} KB` : t("files.supported")}</span>
       </button>
-      <input ref={inputRef} className="visually-hidden" type="file" accept=".docx,.pptx,.xlsx,.txt,.md,.markdown,.html,.htm,.csv,.json,.srt,.vtt,.png,.jpg,.jpeg,.webp" onChange={(event) => choose(event.target.files?.[0])} />
+      <input ref={inputRef} className="visually-hidden" type="file" accept=".pdf,.docx,.pptx,.xlsx,.txt,.md,.markdown,.html,.htm,.csv,.json,.srt,.vtt,.png,.jpg,.jpeg,.webp" onChange={(event) => choose(event.target.files?.[0])} />
       {error && <div className="alert error-alert">{error}</div>}
       <div className="action-row">
         <button className="primary-button" onClick={translate} disabled={!file || submitting || !options.providerId}>
@@ -276,6 +299,7 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
                   {job.streamingText && job.state === "processing" && <div className="file-job-stream"><strong>{t("files.streaming")}</strong><pre>{job.streamingText}</pre></div>}
                   {job.failedBatches.length > 0 && <div className="file-job-partial"><span>{t("files.partialWarning", { count: job.failedSegments })}</span><button className="icon-text-button compact" onClick={() => void retryFailedBatches(job)} disabled={job.state !== "completed" || retryingId === job.id}><RefreshCw size={15} className={retryingId === job.id ? "spin-icon" : undefined} /> {retryingId === job.id ? t("files.retrying") : t("files.retryFailed")}</button></div>}
                   {job.error && <div className="file-job-error">{job.error}</div>}
+                  {(job.state === "queued" || job.state === "processing") && <div className="file-job-actions file-job-cancel"><span className="muted">{job.state === "queued" ? t("files.waitingForQueue") : t(`files.${job.stage}`)}</span><button className="icon-text-button compact" onClick={() => void cancelJob(job)} disabled={cancellingId === job.id}><Ban size={15} /> {cancellingId === job.id ? t("files.cancelling") : t("files.cancel")}</button></div>}
                   {job.state === "completed" && (
                     <div className="file-job-actions">
                       <div className="download-info">
@@ -323,6 +347,7 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
     providerId: defaultProvider,
     promptId: defaultPrompt,
     glossaryIds: [],
+    reasoningEffort: "medium",
   };
   try {
     const stored = JSON.parse(localStorage.getItem("tranova-file-options") || "null") as Partial<TranslationOptionsValue> | null;
@@ -331,6 +356,7 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
       ...fallback,
       ...stored,
       glossaryIds: Array.isArray(stored.glossaryIds) ? stored.glossaryIds : [],
+      reasoningEffort: stored.reasoningEffort === "none" || stored.reasoningEffort === "low" || stored.reasoningEffort === "high" ? stored.reasoningEffort : "medium",
     };
   } catch {
     return fallback;
@@ -339,6 +365,10 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
 
 function readOutputMode(): FileOutputMode {
   return localStorage.getItem("tranova-file-output-mode") === "bilingual" ? "bilingual" : "translated";
+}
+
+function readSummarize() {
+  return localStorage.getItem("tranova-file-summarize") !== "false";
 }
 
 async function resolveDownloadPath(
@@ -389,6 +419,7 @@ function mimeTypeForName(filename: string) {
   const extension = filename.split(".").pop()?.toLowerCase();
   const types: Record<string, string> = {
     docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    pdf: "application/pdf",
     pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     txt: "text/plain",

@@ -10,6 +10,7 @@ import { PromptsPage } from "./pages/PromptsPage";
 import { ProvidersPage } from "./pages/ProvidersPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { TranslatePage } from "./pages/TranslatePage";
+import { LogsPage } from "./pages/LogsPage";
 import type { BootstrapData } from "./types";
 
 export default function App() {
@@ -33,7 +34,11 @@ export default function App() {
         }
       }
       if (!next) throw lastError || new Error(i18n.t("status.backendUnavailable"));
-      setData({ ...next, history: next.history || [] });
+      setData({
+        ...next,
+        history: next.history || [],
+        logs: next.logs || { system: [], conversations: [] },
+      });
       if (!localStorage.getItem("tranova-language")) {
         localStorage.setItem("tranova-language", next.settings.language);
         if (i18n.language !== next.settings.language) await i18n.changeLanguage(next.settings.language);
@@ -45,6 +50,10 @@ export default function App() {
 
   useEffect(() => { void load(); }, [load]);
 
+  useEffect(() => {
+    if (data && !data.settings.loggingEnabled && view === "logs") setView("translate");
+  }, [data, view]);
+
   if (!data) {
     return (
       <div className="startup-state">
@@ -55,21 +64,18 @@ export default function App() {
     );
   }
 
-  const pages: Record<Exclude<View, "files">, React.ReactNode> = {
+  const pages: Record<View, React.ReactNode> = {
     translate: <TranslatePage data={data} onReload={load} />,
+    files: <FilesPage data={data} onReload={load} />,
     history: <HistoryPage data={data} onReload={load} />,
     glossaries: <GlossariesPage data={data} onReload={load} />,
     prompts: <PromptsPage data={data} onReload={load} />,
     providers: <ProvidersPage data={data} onReload={load} />,
     settings: <SettingsPage data={data} onReload={load} />,
+    logs: <LogsPage data={data} />,
   };
 
-  return (
-    <Layout view={view} onViewChange={setView} connected={true}>
-      <div hidden={view !== "files"}>
-        <FilesPage data={data} onReload={load} />
-      </div>
-      {view !== "files" && pages[view]}
-    </Layout>
-  );
+  return <Layout view={view} onViewChange={setView} connected={true} showLogs={data.settings.loggingEnabled}>
+    {(Object.keys(pages) as View[]).map((page) => <div hidden={view !== page} key={page}>{pages[page]}</div>)}
+  </Layout>;
 }

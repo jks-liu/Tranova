@@ -48,7 +48,7 @@ function HistoryItem({ entry, locale, onRemove }: { entry: HistoryEntry; locale:
     <article className="list-item history-item">
       <div className="list-icon dark"><Clock3 size={19} /></div>
       <div className="list-content history-content">
-        <strong className="truncate">{isFile ? entry.filename || t("history.file") : entry.sourceText}</strong>
+        <strong className={isFile ? "truncate" : "history-title"}>{isFile ? entry.filename || t("history.file") : entry.sourceText}</strong>
         <span>{entry.sourceLanguage} → {entry.targetLanguage} · {timestamp}</span>
         {!isFile && <div className="history-preview"><span>{entry.sourceText}</span><span>{entry.translatedText}</span></div>}
       </div>

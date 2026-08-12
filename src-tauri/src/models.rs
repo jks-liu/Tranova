@@ -1,22 +1,10 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderKind {
-    Openai,
-    Deepseek,
-    Doubao,
-    LlamaCpp,
-    LmStudio,
-    Ollama,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Provider {
     pub id: String,
     pub name: String,
-    pub kind: ProviderKind,
     pub base_url: String,
     pub model: String,
     #[serde(default)]
@@ -25,10 +13,30 @@ pub struct Provider {
     pub enabled: bool,
     #[serde(default)]
     pub supports_images: bool,
+    #[serde(default = "default_context_size")]
+    pub context_size: usize,
+    #[serde(default = "default_max_segments")]
+    pub max_segments: usize,
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent: usize,
+    #[serde(default)]
+    pub text_translation_model: bool,
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_context_size() -> usize {
+    32_768
+}
+
+fn default_max_segments() -> usize {
+    16
+}
+
+fn default_max_concurrent() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,16 +80,12 @@ pub struct AppSettings {
     pub web_host: String,
     #[serde(default = "default_web_port")]
     pub web_port: u16,
-    #[serde(default = "default_chunk_chars")]
-    pub max_chunk_chars: usize,
-    #[serde(default = "default_chunk_segments")]
-    pub max_chunk_segments: usize,
-    #[serde(default = "default_concurrent_ai")]
-    pub max_concurrent_ai: usize,
-    #[serde(default = "default_batch_retries")]
-    pub max_batch_retries: usize,
     #[serde(default = "default_ai_timeout_seconds")]
     pub ai_timeout_seconds: u64,
+    #[serde(default)]
+    pub logging_enabled: bool,
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     #[serde(default)]
     pub download_location: DownloadLocation,
     #[serde(default)]
@@ -112,20 +116,11 @@ fn default_web_host() -> String {
 fn default_web_port() -> u16 {
     48731
 }
-fn default_chunk_chars() -> usize {
-    6000
-}
-fn default_chunk_segments() -> usize {
-    100
-}
-fn default_concurrent_ai() -> usize {
-    3
-}
-fn default_batch_retries() -> usize {
-    5
-}
 fn default_ai_timeout_seconds() -> u64 {
     180
+}
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 impl Default for AppSettings {
@@ -135,11 +130,9 @@ impl Default for AppSettings {
             proxy_url: String::new(),
             web_host: default_web_host(),
             web_port: default_web_port(),
-            max_chunk_chars: default_chunk_chars(),
-            max_chunk_segments: default_chunk_segments(),
-            max_concurrent_ai: default_concurrent_ai(),
-            max_batch_retries: default_batch_retries(),
             ai_timeout_seconds: default_ai_timeout_seconds(),
+            logging_enabled: false,
+            log_level: default_log_level(),
             download_location: DownloadLocation::default(),
             custom_download_directory: String::new(),
             auto_download_files: false,
@@ -162,6 +155,10 @@ pub struct AppData {
     pub settings: AppSettings,
     #[serde(default)]
     pub history: Vec<HistoryEntry>,
+    #[serde(default)]
+    pub system_logs: Vec<SystemLogEntry>,
+    #[serde(default)]
+    pub ai_conversations: Vec<AiConversationLog>,
 }
 
 fn default_prompts() -> Vec<PromptTemplate> {
@@ -181,6 +178,8 @@ impl Default for AppData {
             glossaries: Vec::new(),
             settings: AppSettings::default(),
             history: Vec::new(),
+            system_logs: Vec::new(),
+            ai_conversations: Vec::new(),
         }
     }
 }
@@ -215,6 +214,10 @@ pub struct TranslateOptions {
     pub prompt_id: Option<String>,
     #[serde(default)]
     pub glossary_ids: Vec<String>,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub summarize: bool,
     #[serde(default)]
     pub output_mode: FileOutputMode,
 }
@@ -236,6 +239,9 @@ impl TranslateOptions {
             provider_id: self.provider_id,
             prompt_id: self.prompt_id,
             glossary_ids: self.glossary_ids,
+            reasoning_effort: self.reasoning_effort,
+            summarize: self.summarize,
+            context_summary: None,
         }
     }
 }
@@ -248,12 +254,11 @@ mod tests {
     fn settings_default_timeout_is_180_seconds() {
         assert_eq!(AppSettings::default().ai_timeout_seconds, 180);
         let settings: AppSettings = serde_json::from_str(
-            r#"{"language":"en","proxyUrl":"","webHost":"127.0.0.1","webPort":48731,"maxChunkChars":6000,"maxConcurrentAi":3}"#,
+            r#"{"language":"en","proxyUrl":"","webHost":"127.0.0.1","webPort":48731}"#,
         )
         .unwrap();
         assert_eq!(settings.ai_timeout_seconds, 180);
-        assert_eq!(settings.max_chunk_segments, 100);
-        assert_eq!(settings.max_batch_retries, 5);
+        assert_eq!(settings.log_level, "info");
         assert_eq!(settings.download_location, DownloadLocation::Source);
         assert!(settings.custom_download_directory.is_empty());
         assert!(!settings.auto_download_files);
@@ -283,6 +288,16 @@ pub struct TranslateRequest {
     pub prompt_id: Option<String>,
     #[serde(default)]
     pub glossary_ids: Vec<String>,
+    #[serde(default = "default_reasoning_effort")]
+    pub reasoning_effort: String,
+    #[serde(default)]
+    pub summarize: bool,
+    #[serde(default, skip_serializing)]
+    pub context_summary: Option<String>,
+}
+
+fn default_reasoning_effort() -> String {
+    "medium".to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -324,6 +339,7 @@ pub enum FileJobState {
     Processing,
     Completed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -351,4 +367,45 @@ pub struct FileJobStatus {
     pub created_at: String,
     pub source_path: Option<String>,
     pub downloaded_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SystemLogEntry {
+    pub id: String,
+    pub timestamp: String,
+    pub level: String,
+    pub scope: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiConversationLog {
+    pub id: String,
+    pub timestamp: String,
+    pub operation: String,
+    pub provider: String,
+    pub model: String,
+    pub request: String,
+    pub response: String,
+    pub duration_ms: u64,
+    pub success: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogsData {
+    pub system: Vec<SystemLogEntry>,
+    pub conversations: Vec<AiConversationLog>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderModel {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_size: Option<usize>,
 }

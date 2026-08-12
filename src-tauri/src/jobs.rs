@@ -7,6 +7,7 @@ use std::{
 };
 
 use parking_lot::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     files::{FileRetryContext, FileTranslationResult},
@@ -22,6 +23,7 @@ struct JobRecord {
     status: FileJobStatus,
     content: Option<Vec<u8>>,
     retry_context: Option<FileRetryContext>,
+    cancel: CancellationToken,
 }
 
 impl FileJobManager {
@@ -68,6 +70,7 @@ impl FileJobManager {
                 status: status.clone(),
                 content: None,
                 retry_context: None,
+                cancel: CancellationToken::new(),
             },
         );
         status
@@ -93,6 +96,9 @@ impl FileJobManager {
 
     pub fn mark_processing(&self, id: &str) {
         if let Some(record) = self.inner.write().get_mut(id) {
+            if record.cancel.is_cancelled() {
+                return;
+            }
             record.status.state = FileJobState::Processing;
             record.status.stage = "preparing".to_string();
         }
@@ -100,6 +106,9 @@ impl FileJobManager {
 
     pub fn update_progress(&self, id: &str, progress: FileProgress) {
         if let Some(record) = self.inner.write().get_mut(id) {
+            if record.cancel.is_cancelled() {
+                return;
+            }
             record.status.state = FileJobState::Processing;
             record.status.stage = progress.stage;
             record.status.total_segments = progress.total_segments;
@@ -117,6 +126,9 @@ impl FileJobManager {
 
     pub fn complete(&self, id: &str, result: FileTranslationResult) {
         if let Some(record) = self.inner.write().get_mut(id) {
+            if record.cancel.is_cancelled() {
+                return;
+            }
             record.status.state = FileJobState::Completed;
             record.status.stage = "completed".to_string();
             record.status.total_segments = result.total_segments;
@@ -159,11 +171,44 @@ impl FileJobManager {
         record.status.streaming_segments = 0;
         record.status.streaming_batch_segments = 0;
         record.status.streaming_text = None;
+        record.cancel = CancellationToken::new();
         Ok((record.status.clone(), context))
+    }
+
+    pub fn cancellation_token(&self, id: &str) -> Option<CancellationToken> {
+        self.inner
+            .read()
+            .get(id)
+            .map(|record| record.cancel.clone())
+    }
+
+    pub fn cancel(&self, id: &str) -> Result<FileJobStatus, String> {
+        let mut jobs = self.inner.write();
+        let record = jobs
+            .get_mut(id)
+            .ok_or_else(|| "File job was not found".to_string())?;
+        if matches!(
+            record.status.state,
+            FileJobState::Completed | FileJobState::Failed | FileJobState::Cancelled
+        ) {
+            return Err("This file job cannot be cancelled".to_string());
+        }
+        record.cancel.cancel();
+        record.status.state = FileJobState::Cancelled;
+        record.status.stage = "cancelled".to_string();
+        record.status.error = Some("File translation was cancelled".to_string());
+        record.status.streaming_batch = None;
+        record.status.streaming_segments = 0;
+        record.status.streaming_batch_segments = 0;
+        record.status.streaming_text = None;
+        Ok(record.status.clone())
     }
 
     pub fn restore_retry(&self, id: &str, context: FileRetryContext, error: String) {
         if let Some(record) = self.inner.write().get_mut(id) {
+            if record.cancel.is_cancelled() {
+                return;
+            }
             record.status.state = FileJobState::Completed;
             record.status.stage = "completed".to_string();
             record.status.error = Some(error);
@@ -173,6 +218,9 @@ impl FileJobManager {
 
     pub fn fail(&self, id: &str, error: String) {
         if let Some(record) = self.inner.write().get_mut(id) {
+            if record.cancel.is_cancelled() {
+                return;
+            }
             record.status.state = FileJobState::Failed;
             record.status.stage = "failed".to_string();
             record.status.error = Some(error);

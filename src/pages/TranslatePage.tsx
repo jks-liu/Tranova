@@ -1,7 +1,7 @@
 import { Check, Clipboard, Languages } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { api } from "../api";
+import { translateStream } from "../api";
 import { TranslationOptions, type TranslationOptionsValue } from "../components/TranslationOptions";
 import type { BootstrapData } from "../types";
 
@@ -37,7 +37,11 @@ export function TranslatePage({ data, onReload }: { data: BootstrapData; onReloa
     setWorking(true);
     setError("");
     try {
-      const response = await api.translate({ text: source, ...options, promptId: options.promptId || undefined });
+      setResult("");
+      const response = await translateStream(
+        { text: source, ...options, promptId: options.promptId || undefined },
+        (text) => setResult(text),
+      );
       setResult(response.translatedText);
       await onReload();
     } catch (reason) {
@@ -96,6 +100,7 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
     providerId: defaultProvider,
     promptId: defaultPrompt,
     glossaryIds: [],
+    reasoningEffort: "medium",
   };
   try {
     const stored = JSON.parse(localStorage.getItem("tranova-translate-options") || "null") as Partial<TranslationOptionsValue> | null;
@@ -104,6 +109,7 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
       ...fallback,
       ...stored,
       glossaryIds: Array.isArray(stored.glossaryIds) ? stored.glossaryIds : [],
+      reasoningEffort: stored.reasoningEffort === "none" || stored.reasoningEffort === "low" || stored.reasoningEffort === "high" ? stored.reasoningEffort : "medium",
     };
   } catch {
     return fallback;

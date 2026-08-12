@@ -1,54 +1,98 @@
-import { Bot, CheckCircle2, Pencil, Plus, Trash2, Wifi } from "lucide-react";
+import { Bot, CheckCircle2, Pencil, Plus, Search, Trash2, Wifi } from "lucide-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { Modal } from "../components/Modal";
-import type { BootstrapData, Provider, ProviderKind } from "../types";
+import type { BootstrapData, Provider, ProviderModel } from "../types";
 
-const PROVIDER_DEFAULTS: Record<ProviderKind, { name: string; baseUrl: string; model: string }> = {
-  openai: { name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1-mini" },
-  deepseek: { name: "DeepSeek", baseUrl: "https://api.deepseek.com", model: "deepseek-chat" },
-  doubao: { name: "Doubao", baseUrl: "https://ark.cn-beijing.volces.com/api/v3", model: "" },
-  llama_cpp: { name: "llama.cpp", baseUrl: "http://127.0.0.1:8080/v1", model: "local-model" },
-  lm_studio: { name: "LM Studio", baseUrl: "http://127.0.0.1:1234/v1", model: "local-model" },
-  ollama: { name: "Ollama", baseUrl: "http://127.0.0.1:11434", model: "qwen3:8b" },
+const DEFAULT_PROVIDER = {
+  name: "OpenAI-compatible provider",
+  baseUrl: "https://api.openai.com/v1",
+  model: "gpt-4.1-mini",
 };
 
 function blankProvider(): Provider {
-  const defaults = PROVIDER_DEFAULTS.openai;
-  return { id: crypto.randomUUID(), kind: "openai", ...defaults, apiKey: "", enabled: true, supportsImages: false };
+  return {
+    id: crypto.randomUUID(),
+    ...DEFAULT_PROVIDER,
+    apiKey: "",
+    enabled: true,
+    supportsImages: false,
+    contextSize: 32_768,
+    maxSegments: 16,
+    maxConcurrent: 2,
+    textTranslationModel: false,
+  };
 }
 
 export function ProvidersPage({ data, onReload }: { data: BootstrapData; onReload: () => Promise<void> }) {
   const { t } = useTranslation();
   const [editing, setEditing] = useState<Provider | null>(null);
+  const [models, setModels] = useState<ProviderModel[]>([]);
+  const [discovering, setDiscovering] = useState(false);
   const [testing, setTesting] = useState<string | null>(null);
   const [testMessage, setTestMessage] = useState("");
   const [error, setError] = useState("");
 
-  const changeKind = (kind: ProviderKind) => {
+  const edit = (provider: Provider) => {
+    setModels([]);
+    setError("");
+    setEditing({ ...provider });
+  };
+
+  const discover = async () => {
     if (!editing) return;
-    setEditing({ ...editing, kind, ...PROVIDER_DEFAULTS[kind] });
+    setDiscovering(true);
+    setError("");
+    try {
+      const nextModels = await api.discoverModels(editing.baseUrl, editing.apiKey);
+      setModels(nextModels);
+      const selected = nextModels.find((model) => model.id === editing.model) || nextModels[0];
+      if (selected) {
+        setEditing((current) => current ? {
+          ...current,
+          model: nextModels.some((model) => model.id === current.model) ? current.model : selected.id,
+          contextSize: selected.contextSize || current.contextSize,
+        } : current);
+      }
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setDiscovering(false);
+    }
   };
 
   const save = async () => {
     if (!editing) return;
-    try { await api.saveProvider(editing); setEditing(null); await onReload(); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    setError("");
+    try {
+      await api.saveProvider(editing);
+      setEditing(null);
+      await onReload();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
   const test = async (id: string) => {
-    setTesting(id); setError(""); setTestMessage("");
-    try { const response = await api.testProvider(id); setTestMessage(response.message || t("provider.connected")); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
-    finally { setTesting(null); }
+    setTesting(id);
+    setError("");
+    setTestMessage("");
+    try {
+      const response = await api.testProvider(id);
+      setTestMessage(response.message || t("provider.connected"));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setTesting(null);
+    }
   };
 
   return (
     <section className="page">
       <div className="page-heading">
         <div><h1>{t("provider.title")}</h1><p>{t("provider.subtitle")}</p></div>
-        <button className="primary-button" onClick={() => setEditing(blankProvider())}><Plus size={18} /> {t("provider.new")}</button>
+        <button className="primary-button" onClick={() => { setModels([]); setError(""); setEditing(blankProvider()); }}><Plus size={18} /> {t("provider.new")}</button>
       </div>
       {error && <div className="alert error-alert">{error}</div>}
       {testMessage && <div className="alert success-alert"><CheckCircle2 size={18} /> {testMessage}</div>}
@@ -56,24 +100,31 @@ export function ProvidersPage({ data, onReload }: { data: BootstrapData; onReloa
         {data.providers.map((provider) => (
           <article className="list-item provider-item" key={provider.id}>
             <div className="list-icon dark"><Bot size={19} /></div>
-            <div className="list-content"><strong>{provider.name}</strong><span>{provider.kind.replace("_", " ")} · {provider.model || t("common.noModel")}</span></div>
+            <div className="list-content"><strong>{provider.name}</strong><span>{provider.model || t("common.noModel")} · {provider.contextSize.toLocaleString()} {t("provider.contextUnit")} · {provider.maxSegments} {t("provider.segmentsUnit")} · {provider.maxConcurrent} {t("provider.concurrentUnit")}</span></div>
             <span className={`badge ${provider.enabled ? "enabled" : ""}`}>{provider.enabled ? t("common.enabled") : t("common.disabled")}</span>
             <div className="list-actions">
-              <button className="icon-text-button compact" onClick={() => test(provider.id)} disabled={testing === provider.id}><Wifi size={16} /> {testing === provider.id ? t("common.testing") : t("common.test")}</button>
-              <button className="icon-button" onClick={() => setEditing({ ...provider })}><Pencil size={17} /></button>
-              <button className="icon-button danger" onClick={async () => { await api.deleteProvider(provider.id); await onReload(); }}><Trash2 size={17} /></button>
+              <button className="icon-text-button compact" onClick={() => void test(provider.id)} disabled={testing === provider.id}><Wifi size={16} /> {testing === provider.id ? t("common.testing") : t("common.test")}</button>
+              <button className="icon-button" onClick={() => edit(provider)} title={t("common.edit")} aria-label={t("common.edit")}><Pencil size={17} /></button>
+              <button className="icon-button danger" onClick={async () => { await api.deleteProvider(provider.id); await onReload(); }} title={t("common.delete")} aria-label={t("common.delete")}><Trash2 size={17} /></button>
             </div>
           </article>
         ))}
       </div>
       {editing && (
-        <Modal title={editing.name || t("provider.new")} onClose={() => setEditing(null)} footer={<><button className="secondary-button" onClick={() => setEditing(null)}>{t("common.cancel")}</button><button className="primary-button" onClick={save} disabled={!editing.name || !editing.baseUrl || !editing.model}>{t("common.save")}</button></>}>
+        <Modal title={editing.name || t("provider.new")} onClose={() => setEditing(null)} footer={<><button className="secondary-button" onClick={() => setEditing(null)}>{t("common.cancel")}</button><button className="primary-button" onClick={save} disabled={!editing.name || !editing.baseUrl || !editing.model || !editing.contextSize}>{t("common.save")}</button></>}>
           <div className="form-grid two-columns">
-            <label><span>{t("provider.type")}</span><select value={editing.kind} onChange={(event) => changeKind(event.target.value as ProviderKind)}>{Object.keys(PROVIDER_DEFAULTS).map((kind) => <option value={kind} key={kind}>{kind.replace("_", " ")}</option>)}</select></label>
+            <label className="full"><span>{t("provider.baseUrl")}</span><input value={editing.baseUrl} onChange={(event) => setEditing({ ...editing, baseUrl: event.target.value })} placeholder="http://127.0.0.1:11434/v1" /></label>
+            <p className="field-hint full">{t("provider.compatibilityHint")}</p>
             <label><span>{t("common.name")}</span><input value={editing.name} onChange={(event) => setEditing({ ...editing, name: event.target.value })} /></label>
-            <label className="full"><span>{t("provider.baseUrl")}</span><input value={editing.baseUrl} onChange={(event) => setEditing({ ...editing, baseUrl: event.target.value })} /></label>
-            <label><span>{t("provider.model")}</span><input value={editing.model} onChange={(event) => setEditing({ ...editing, model: event.target.value })} /></label>
             <label><span>{t("provider.apiKey")}</span><input type="password" value={editing.apiKey} onChange={(event) => setEditing({ ...editing, apiKey: event.target.value })} placeholder={t("provider.apiKeyHint")} /></label>
+            <label className="full"><span>{t("provider.model")}</span><div className="inline-control"><input list="tranova-provider-models" value={editing.model} onChange={(event) => {
+              const model = models.find((item) => item.id === event.target.value);
+              setEditing({ ...editing, model: event.target.value, contextSize: model?.contextSize || editing.contextSize });
+            }} /><button className="icon-text-button compact" type="button" onClick={() => void discover()} disabled={discovering || !editing.baseUrl} title={t("provider.discoverModels")}><Search size={16} /> {discovering ? t("provider.discovering") : t("provider.discoverModels")}</button></div><datalist id="tranova-provider-models">{models.map((model) => <option value={model.id} key={model.id}>{model.contextSize ? `${model.id} (${model.contextSize.toLocaleString()})` : model.id}</option>)}</datalist></label>
+            <label><span>{t("provider.contextSize")}</span><input type="number" min={1024} max={2000000} step={1024} value={editing.contextSize} onChange={(event) => setEditing({ ...editing, contextSize: Number(event.target.value) })} /></label>
+            <label><span>{t("provider.maxSegments")}</span><input type="number" min={1} max={1024} value={editing.maxSegments} onChange={(event) => setEditing({ ...editing, maxSegments: Number(event.target.value) })} /></label>
+            <label><span>{t("provider.maxConcurrent")}</span><input type="number" min={1} max={64} value={editing.maxConcurrent} onChange={(event) => setEditing({ ...editing, maxConcurrent: Number(event.target.value) })} /></label>
+            <label className="switch-row"><input type="checkbox" checked={editing.textTranslationModel} onChange={(event) => setEditing({ ...editing, textTranslationModel: event.target.checked })} /><span>{t("provider.textTranslationModel")}</span></label>
             <label className="switch-row"><input type="checkbox" checked={editing.enabled} onChange={(event) => setEditing({ ...editing, enabled: event.target.checked })} /><span>{t("common.enabled")}</span></label>
             <label className="switch-row"><input type="checkbox" checked={editing.supportsImages} onChange={(event) => setEditing({ ...editing, supportsImages: event.target.checked })} /><span>{t("provider.images")}</span></label>
           </div>

@@ -1,20 +1,23 @@
-export type ProviderKind =
-  | "openai"
-  | "deepseek"
-  | "doubao"
-  | "llama_cpp"
-  | "lm_studio"
-  | "ollama";
+export type ReasoningEffort = "none" | "low" | "medium" | "high";
+export type LogLevel = "debug" | "info" | "warn" | "error";
+
+export interface ProviderModel {
+  id: string;
+  contextSize?: number;
+}
 
 export interface Provider {
   id: string;
   name: string;
-  kind: ProviderKind;
   baseUrl: string;
   model: string;
   apiKey: string;
   enabled: boolean;
   supportsImages: boolean;
+  contextSize: number;
+  maxSegments: number;
+  maxConcurrent: number;
+  textTranslationModel: boolean;
 }
 
 export interface GlossaryEntry {
@@ -44,11 +47,9 @@ export interface AppSettings {
   proxyUrl: string;
   webHost: string;
   webPort: number;
-  maxChunkChars: number;
-  maxChunkSegments: number;
-  maxConcurrentAi: number;
-  maxBatchRetries: number;
   aiTimeoutSeconds: number;
+  loggingEnabled: boolean;
+  logLevel: LogLevel;
   downloadLocation: DownloadLocation;
   customDownloadDirectory: string;
   autoDownloadFiles: boolean;
@@ -65,6 +66,7 @@ export interface BootstrapData {
   prompts: PromptTemplate[];
   settings: AppSettings;
   history: HistoryEntry[];
+  logs: LogsData;
   serverUrl: string;
 }
 
@@ -88,6 +90,8 @@ export interface TranslateRequest {
   providerId: string;
   promptId?: string;
   glossaryIds: string[];
+  reasoningEffort: ReasoningEffort;
+  summarize?: boolean;
 }
 
 export interface TranslationResult {
@@ -98,7 +102,7 @@ export interface TranslationResult {
 
 export type FileOutputMode = "translated" | "bilingual";
 
-export type FileJobState = "queued" | "processing" | "completed" | "failed";
+export type FileJobState = "queued" | "processing" | "completed" | "failed" | "cancelled";
 
 export interface FileJobStatus {
   id: string;
@@ -134,4 +138,30 @@ export interface FileBatchFailure {
 
 export interface TranslateFileOptions extends Omit<TranslateRequest, "text"> {
   outputMode: FileOutputMode;
+}
+
+export interface SystemLogEntry {
+  id: string;
+  timestamp: string;
+  level: LogLevel;
+  scope: string;
+  message: string;
+}
+
+export interface AiConversationLog {
+  id: string;
+  timestamp: string;
+  operation: string;
+  provider: string;
+  model: string;
+  request: string;
+  response: string;
+  durationMs: number;
+  success: boolean;
+  error?: string;
+}
+
+export interface LogsData {
+  system: SystemLogEntry[];
+  conversations: AiConversationLog[];
 }

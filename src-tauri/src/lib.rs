@@ -6,7 +6,7 @@ mod scheduler;
 mod server;
 mod store;
 
-use std::{fs, path::PathBuf};
+use std::{fs, path::PathBuf, process::Command};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use jobs::FileJobManager;
@@ -78,6 +78,36 @@ fn read_dropped_file(path: String) -> Result<DroppedFile, String> {
     })
 }
 
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let path = PathBuf::from(path);
+    if !path.exists() {
+        return Err("The requested path does not exist".to_string());
+    }
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("explorer.exe");
+        command.arg(&path);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(&path);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(&path);
+        command
+    };
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Unable to open path: {error}"))
+}
+
 pub fn run() {
     let store = AppStore::load().expect("unable to initialize Tranova's user data store");
     let settings = store.settings();
@@ -97,11 +127,11 @@ pub fn run() {
             store,
         })
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             server_url,
             read_dropped_file,
-            save_file_job
+            save_file_job,
+            open_path
         ])
         .setup(move |app| {
             let asset_dir = web_asset_dir(app.handle());
