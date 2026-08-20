@@ -96,7 +96,8 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
   const refreshJobs = syncJobs;
 
   useEffect(() => {
-    if (!options.providerId && defaultProvider) setOptions((current) => ({ ...current, providerId: defaultProvider }));
+    const providerExists = data.providers.some((provider) => provider.enabled && provider.id === options.providerId);
+    if (!providerExists && options.providerId !== defaultProvider) setOptions((current) => ({ ...current, providerId: defaultProvider }));
     if (options.promptId && !data.prompts.some((prompt) => prompt.id === options.promptId)) {
       setOptions((current) => ({ ...current, promptId: data.prompts[0]?.id || "" }));
     }
@@ -200,7 +201,7 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
   };
 
   const retryFailedBatches = async (job: FileJobStatus) => {
-    if (job.state !== "completed" || job.failedBatches.length === 0) return;
+    if (job.state !== "failed" && (job.state !== "completed" || job.failedBatches.length === 0)) return;
     setRetryingId(job.id);
     setError("");
     try {
@@ -297,7 +298,7 @@ export function FilesPage({ data, onReload }: { data: BootstrapData; onReload: (
                     {job.skippedSegments > 0 && <span>{t("files.skipped", { count: job.skippedSegments })}</span>}
                   </div>
                   {job.streamingText && job.state === "processing" && <div className="file-job-stream"><strong>{t("files.streaming")}</strong><pre>{job.streamingText}</pre></div>}
-                  {job.failedBatches.length > 0 && <div className="file-job-partial"><span>{t("files.partialWarning", { count: job.failedSegments })}</span><button className="icon-text-button compact" onClick={() => void retryFailedBatches(job)} disabled={job.state !== "completed" || retryingId === job.id}><RefreshCw size={15} className={retryingId === job.id ? "spin-icon" : undefined} /> {retryingId === job.id ? t("files.retrying") : t("files.retryFailed")}</button></div>}
+                  {(job.state === "failed" || job.failedBatches.length > 0) && <div className="file-job-partial"><span>{job.state === "failed" ? t("files.retryFileHint") : t("files.partialWarning", { count: job.failedSegments })}</span><button className="icon-text-button compact" onClick={() => void retryFailedBatches(job)} disabled={(job.state !== "failed" && job.state !== "completed") || retryingId === job.id}><RefreshCw size={15} className={retryingId === job.id ? "spin-icon" : undefined} /> {retryingId === job.id ? t("files.retrying") : job.state === "failed" ? t("files.retryFile") : t("files.retryFailed")}</button></div>}
                   {job.error && <div className="file-job-error">{job.error}</div>}
                   {(job.state === "queued" || job.state === "processing") && <div className="file-job-actions file-job-cancel"><span className="muted">{job.state === "queued" ? t("files.waitingForQueue") : t(`files.${job.stage}`)}</span><button className="icon-text-button compact" onClick={() => void cancelJob(job)} disabled={cancellingId === job.id}><Ban size={15} /> {cancellingId === job.id ? t("files.cancelling") : t("files.cancel")}</button></div>}
                   {job.state === "completed" && (
@@ -347,7 +348,7 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
     providerId: defaultProvider,
     promptId: defaultPrompt,
     glossaryIds: [],
-    reasoningEffort: "medium",
+    reasoningEffort: "none",
   };
   try {
     const stored = JSON.parse(localStorage.getItem("tranova-file-options") || "null") as Partial<TranslationOptionsValue> | null;
@@ -356,7 +357,7 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
       ...fallback,
       ...stored,
       glossaryIds: Array.isArray(stored.glossaryIds) ? stored.glossaryIds : [],
-      reasoningEffort: stored.reasoningEffort === "none" || stored.reasoningEffort === "low" || stored.reasoningEffort === "high" ? stored.reasoningEffort : "medium",
+      reasoningEffort: stored.reasoningEffort === "none" || stored.reasoningEffort === "low" || stored.reasoningEffort === "medium" || stored.reasoningEffort === "high" ? stored.reasoningEffort : "none",
     };
   } catch {
     return fallback;

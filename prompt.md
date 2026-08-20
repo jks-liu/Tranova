@@ -96,10 +96,36 @@ Network request failed: error sending request for url (http://127.0.0.1:11434/v1
 ```
 - 分析代码中哪些是在重复造轮子，对于代码量比较大的轮子，请使用成熟的库替代，仅限于成熟的库，不要使用那种根本没人维护的小库。对于只有几十行代码的小轮子请保留
 
-## TODO
-翻译失败的文件添加一个重试按钮
-Text translation common model 介绍
-proxy 绑定模型
-默认无推理
+### 8/12
+- 默认推理强度改成None
+- 失败的文件翻译添加一个重试按钮
+- 文件翻译时控制ai返回的summary长度，这个summary只要能提示翻译主题就好，无需完整总结。summary时发送给ai的文本长度除了原有限制外再加一个4K的限制。
+- AI provider的模型设置中添加一个关于proxy的菜单，有三个选项
+    1. 不使用代理
+    2. 使用设置中的设置的代理
+    3. 使用系统代理
+- “文本翻译常用模型”英文翻译改成“Commonly used models for text translation”，并加小字解释这个选项的含义
+- UI中的很多checkbox不管有没有enable都显示“enabled”提示文本，请删除这个提示文本
+- 左侧的tab不应该跟着右边的内容一起scroll
+- 另一台机器翻译文件会显示如下错误（本机没问题）
+    * Unable to summarize document: Selected AI provider does not exist or is disabled
+    * Selected AI provider was not found
+  并且只在使用桌面版时有问题，使用web访问就没问题
+- AI request timeout设置中的提示文字“including local model generation”是什么意思？
+- history中source文本重复显示了
 
-思考
+### 8/13
+
+API测试正常但翻译文件显示如下错误
+The file translation failed before a result was created.
+Unable to summarize document: Responses API returned no output text
+
+- 开启文件summary还是有如下问题
+The file translation failed before a result was created.
+Unable to summarize document: Responses API returned no output text
+我猜测可能是有些模型无法关闭推理
+
+
+## TODO
+- 取消后再翻译可能有问题
+

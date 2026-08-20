@@ -14,7 +14,8 @@ use thiserror::Error;
 
 use crate::{
     models::{
-        AiConversationLog, AppData, Provider, ProviderModel, TranslateRequest, TranslationResult,
+        AiConversationLog, AppData, Provider, ProviderModel, ProxyMode, TranslateRequest,
+        TranslationResult,
     },
     store::AppStore,
 };
@@ -32,6 +33,7 @@ pub enum AiError {
 pub type StreamCallback = Arc<dyn Fn(String) + Send + Sync>;
 
 pub const SEGMENT_SEPARATOR: &str = "\n---TRANOVA-SEGMENT-7F3A---\n";
+const MAX_DOCUMENT_SUMMARY_CHARS: usize = 512;
 
 pub fn contains_segment_separator(text: &str) -> bool {
     text.replace("\r\n", "\n")
@@ -122,11 +124,9 @@ pub async fn summarize(
     validate_languages(request)?;
     let data = store.snapshot();
     let provider = enabled_provider(&data, &request.provider_id)?;
-    let mut summary_request = request.clone();
-    summary_request.text = text.to_string();
-    summary_request.context_summary = None;
-    let instruction = "Create a concise factual translation-context summary of the source document. Keep named entities, terminology, dates, numbers, structure and ambiguous references. Do not translate the document and do not add preamble; return only the summary that another translator can use.";
-    translate_with_data_instruction(
+    let summary_request = document_summary_request(request, text);
+    let instruction = "Identify the source document's main topic and domain for a translator. Mention only the most important proper nouns, specialized terms, dates, numbers or references needed to understand the text. Keep it very short: this is a topic note, not a full summary. Do not translate the document, add a preamble, or include general commentary; return only the note.";
+    let summary = translate_with_data_instruction(
         store,
         &data,
         &provider,
@@ -135,7 +135,32 @@ pub async fn summarize(
         None,
         "document summary",
     )
-    .await
+    .await?;
+    Ok(truncate_document_summary(&summary))
+}
+
+fn document_summary_request(request: &TranslateRequest, text: &str) -> TranslateRequest {
+    let mut summary_request = request.clone();
+    summary_request.text = text.to_string();
+    summary_request.context_summary = None;
+    summary_request
+}
+
+fn truncate_document_summary(summary: &str) -> String {
+    let summary = summary.trim();
+    if summary.chars().count() <= MAX_DOCUMENT_SUMMARY_CHARS {
+        return summary.to_string();
+    }
+
+    let mut truncated = summary
+        .chars()
+        .take(MAX_DOCUMENT_SUMMARY_CHARS)
+        .collect::<String>();
+    if let Some(index) = truncated.rfind(|character: char| character.is_whitespace()) {
+        truncated.truncate(index);
+    }
+    truncated.push_str("...");
+    truncated
 }
 
 pub async fn translate_image(
@@ -178,7 +203,11 @@ pub async fn translate_image(
     );
     let started = Instant::now();
     let result = async {
-        let client = build_client(&data.settings.proxy_url, data.settings.ai_timeout_seconds)?;
+        let client = build_client(
+            provider.proxy_mode,
+            &data.settings.proxy_url,
+            data.settings.ai_timeout_seconds,
+        )?;
         let response = send_responses_json(
             &client,
             &endpoint(&provider.base_url, "/responses"),
@@ -228,10 +257,11 @@ pub async fn translate_image(
 pub async fn list_models(
     base_url: &str,
     api_key: &str,
+    proxy_mode: ProxyMode,
     proxy_url: &str,
     timeout_seconds: u64,
 ) -> Result<Vec<ProviderModel>, AiError> {
-    let client = build_client(proxy_url, timeout_seconds)?;
+    let client = build_client(proxy_mode, proxy_url, timeout_seconds)?;
     let mut call = client.get(endpoint(base_url, "/models"));
     if !api_key.trim().is_empty() {
         call = call.bearer_auth(api_key.trim());
@@ -313,6 +343,7 @@ fn enabled_provider(data: &AppData, id: &str) -> Result<Provider, AiError> {
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn translate_with_data_instruction(
     store: &AppStore,
     data: &AppData,
@@ -480,7 +511,11 @@ async fn call_responses(
     if !matches!(reasoning_effort, "" | "none") {
         body["reasoning"] = json!({ "effort": reasoning_effort });
     }
-    let client = build_client(&data.settings.proxy_url, data.settings.ai_timeout_seconds)?;
+    let client = build_client(
+        provider.proxy_mode,
+        &data.settings.proxy_url,
+        data.settings.ai_timeout_seconds,
+    )?;
     send_responses_request(
         &client,
         &endpoint(&provider.base_url, "/responses"),
@@ -785,12 +820,25 @@ fn parse_batch_response(response: &str, expected: usize) -> Result<Vec<String>, 
     Ok(parts.into_iter().map(str::to_string).collect())
 }
 
-fn build_client(proxy_url: &str, timeout_seconds: u64) -> Result<Client, AiError> {
+fn build_client(
+    proxy_mode: ProxyMode,
+    proxy_url: &str,
+    timeout_seconds: u64,
+) -> Result<Client, AiError> {
     let mut builder = Client::builder();
-    if !proxy_url.trim().is_empty() {
-        let proxy = Proxy::all(proxy_url.trim())
-            .map_err(|error| AiError::Message(format!("Invalid proxy URL: {error}")))?;
-        builder = builder.proxy(proxy);
+    match proxy_mode {
+        ProxyMode::None => {
+            builder = builder.no_proxy();
+        }
+        ProxyMode::Settings => {
+            builder = builder.no_proxy();
+            if !proxy_url.trim().is_empty() {
+                let proxy = Proxy::all(proxy_url.trim())
+                    .map_err(|error| AiError::Message(format!("Invalid proxy URL: {error}")))?;
+                builder = builder.proxy(proxy);
+            }
+        }
+        ProxyMode::System => {}
     }
     builder
         .connect_timeout(AI_CONNECT_TIMEOUT)
@@ -947,8 +995,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        append_response_stream_line, decode_responses_image, parse_batch_response,
-        SEGMENT_SEPARATOR,
+        append_response_stream_line, decode_responses_image, document_summary_request,
+        parse_batch_response, truncate_document_summary, TranslateRequest,
+        MAX_DOCUMENT_SUMMARY_CHARS, SEGMENT_SEPARATOR,
     };
 
     #[test]
@@ -964,6 +1013,36 @@ mod tests {
             ["one", "two"]
         );
         assert!(parse_batch_response("one\ntwo", 2).is_err());
+    }
+
+    #[test]
+    fn document_summary_preserves_reasoning_setting() {
+        let request = TranslateRequest {
+            text: "original".to_string(),
+            source_language: "English".to_string(),
+            target_language: "Chinese".to_string(),
+            provider_id: "provider".to_string(),
+            prompt_id: None,
+            glossary_ids: Vec::new(),
+            reasoning_effort: "high".to_string(),
+            summarize: true,
+            context_summary: Some("previous note".to_string()),
+        };
+
+        let summary = document_summary_request(&request, "document sample");
+
+        assert_eq!(summary.text, "document sample");
+        assert_eq!(summary.reasoning_effort, "high");
+        assert!(summary.context_summary.is_none());
+    }
+
+    #[test]
+    fn document_summary_is_trimmed_locally_when_too_long() {
+        let long_summary = format!("{} final detail", "topic ".repeat(100));
+        let summary = truncate_document_summary(&long_summary);
+
+        assert!(summary.ends_with("..."));
+        assert!(summary.chars().count() <= MAX_DOCUMENT_SUMMARY_CHARS + 3);
     }
 
     #[test]

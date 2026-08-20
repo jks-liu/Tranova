@@ -23,7 +23,7 @@ use crate::{
     jobs::FileJobManager,
     models::{
         AppData, AppSettings, FileJobStatus, Glossary, HistoryEntry, LogsData, PromptTemplate,
-        Provider, ProviderModel, TranslateOptions, TranslateRequest, TranslationResult,
+        Provider, ProviderModel, ProxyMode, TranslateOptions, TranslateRequest, TranslationResult,
     },
     scheduler::{AiScheduler, Priority},
     store::AppStore,
@@ -64,6 +64,8 @@ struct ModelDiscoveryRequest {
     base_url: String,
     #[serde(default)]
     api_key: String,
+    #[serde(default)]
+    proxy_mode: ProxyMode,
 }
 
 #[derive(Serialize)]
@@ -263,7 +265,11 @@ async fn translate_file(
         options.ok_or_else(|| ApiError::bad_request("Translation options are required"))?;
     let output_mode = options.output_mode;
     let request = options.into_request();
-    let status = state.jobs.create(&filename, output_mode, source_path);
+    let retry_context =
+        files::FileRetryContext::new(&filename, bytes.clone(), request.clone(), output_mode);
+    let status = state
+        .jobs
+        .create(&filename, output_mode, source_path, retry_context);
     let job_id = status.id.clone();
     state.store.add_system_log(
         "info",
@@ -408,9 +414,7 @@ async fn retry_file_job(
         let progress: files::ProgressCallback = Arc::new(move |value| {
             progress_jobs.update_progress(&progress_job_id, value);
         });
-        match files::retry_failed_batches_with_cancel(&store, &scheduler, context, progress, cancel)
-            .await
-        {
+        match files::retry_file_with_cancel(&store, &scheduler, context, progress, cancel).await {
             Ok(result) => jobs.complete(&job_id, result),
             Err(files::FileError::Cancelled) => {
                 let _ = jobs.cancel(&job_id);
@@ -628,6 +632,7 @@ async fn discover_models(
     let models = ai::list_models(
         &request.base_url,
         &request.api_key,
+        request.proxy_mode,
         &settings.proxy_url,
         settings.ai_timeout_seconds,
     )

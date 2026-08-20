@@ -9,6 +9,8 @@ pub struct Provider {
     pub model: String,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
+    pub proxy_mode: ProxyMode,
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default)]
@@ -21,6 +23,15 @@ pub struct Provider {
     pub max_concurrent: usize,
     #[serde(default)]
     pub text_translation_model: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyMode {
+    None,
+    #[default]
+    Settings,
+    System,
 }
 
 fn default_true() -> bool {
@@ -248,7 +259,7 @@ impl TranslateOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppSettings, DownloadLocation, TranslateOptions};
+    use super::{AppSettings, DownloadLocation, Provider, ProxyMode, TranslateOptions};
 
     #[test]
     fn settings_default_timeout_is_180_seconds() {
@@ -274,6 +285,16 @@ mod tests {
         let request = options.into_request();
         assert!(request.text.is_empty());
         assert_eq!(request.target_language, "zh");
+        assert_eq!(request.reasoning_effort, "none");
+    }
+
+    #[test]
+    fn providers_default_to_the_settings_proxy_mode() {
+        let provider: Provider = serde_json::from_str(
+            r#"{"id":"provider","name":"Provider","baseUrl":"http://127.0.0.1:1","model":"model"}"#,
+        )
+        .unwrap();
+        assert_eq!(provider.proxy_mode, ProxyMode::Settings);
     }
 }
 
@@ -297,7 +318,7 @@ pub struct TranslateRequest {
 }
 
 fn default_reasoning_effort() -> String {
-    "medium".to_string()
+    "none".to_string()
 }
 
 #[derive(Debug, Serialize)]

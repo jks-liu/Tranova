@@ -36,6 +36,7 @@ impl FileJobManager {
         filename: &str,
         output_mode: FileOutputMode,
         source_path: Option<String>,
+        retry_context: FileRetryContext,
     ) -> FileJobStatus {
         let id = job_id();
         let status = FileJobStatus {
@@ -69,7 +70,7 @@ impl FileJobManager {
             JobRecord {
                 status: status.clone(),
                 content: None,
-                retry_context: None,
+                retry_context: Some(retry_context),
                 cancel: CancellationToken::new(),
             },
         );
@@ -155,9 +156,12 @@ impl FileJobManager {
         let record = jobs
             .get_mut(id)
             .ok_or_else(|| "File job was not found".to_string())?;
-        if !matches!(record.status.state, FileJobState::Completed)
-            || record.status.failed_batches.is_empty()
-        {
+        let retryable = match record.status.state {
+            FileJobState::Completed => !record.status.failed_batches.is_empty(),
+            FileJobState::Failed => record.retry_context.is_some(),
+            _ => false,
+        };
+        if !retryable {
             return Err("This file job has no failed batches to retry".to_string());
         }
         let context = record
@@ -209,8 +213,17 @@ impl FileJobManager {
             if record.cancel.is_cancelled() {
                 return;
             }
-            record.status.state = FileJobState::Completed;
-            record.status.stage = "completed".to_string();
+            let has_result = record.content.is_some();
+            record.status.state = if has_result {
+                FileJobState::Completed
+            } else {
+                FileJobState::Failed
+            };
+            record.status.stage = if has_result {
+                "completed".to_string()
+            } else {
+                "failed".to_string()
+            };
             record.status.error = Some(error);
             record.retry_context = Some(context);
         }
@@ -313,7 +326,10 @@ mod tests {
     };
 
     use super::FileJobManager;
-    use crate::{files::FileTranslationResult, models::FileOutputMode};
+    use crate::{
+        files::{FileRetryContext, FileTranslationResult},
+        models::FileOutputMode,
+    };
 
     #[test]
     fn completed_file_can_be_saved_and_reports_its_path() {
@@ -322,6 +338,22 @@ mod tests {
             "notes.txt",
             FileOutputMode::Translated,
             Some("C:\\source\\notes.txt".to_string()),
+            FileRetryContext::new(
+                "notes.txt",
+                b"notes".to_vec(),
+                crate::models::TranslateRequest {
+                    text: String::new(),
+                    source_language: "en".to_string(),
+                    target_language: "zh".to_string(),
+                    provider_id: "provider".to_string(),
+                    prompt_id: None,
+                    glossary_ids: Vec::new(),
+                    reasoning_effort: "none".to_string(),
+                    summarize: false,
+                    context_summary: None,
+                },
+                FileOutputMode::Translated,
+            ),
         );
         jobs.complete(
             &queued.id,
@@ -355,5 +387,39 @@ mod tests {
         );
         assert_eq!(saved.source_path.as_deref(), Some("C:\\source\\notes.txt"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_file_can_be_retried_with_its_original_context() {
+        let jobs = FileJobManager::new();
+        let queued = jobs.create(
+            "notes.txt",
+            FileOutputMode::Translated,
+            None,
+            FileRetryContext::new(
+                "notes.txt",
+                b"notes".to_vec(),
+                crate::models::TranslateRequest {
+                    text: String::new(),
+                    source_language: "en".to_string(),
+                    target_language: "zh".to_string(),
+                    provider_id: "provider".to_string(),
+                    prompt_id: None,
+                    glossary_ids: Vec::new(),
+                    reasoning_effort: "none".to_string(),
+                    summarize: false,
+                    context_summary: None,
+                },
+                FileOutputMode::Translated,
+            ),
+        );
+        jobs.fail(&queued.id, "provider unavailable".to_string());
+
+        let (status, _context) = jobs.begin_retry(&queued.id).unwrap();
+        assert!(matches!(
+            status.state,
+            crate::models::FileJobState::Processing
+        ));
+        assert!(jobs.begin_retry(&queued.id).is_err());
     }
 }

@@ -14,7 +14,7 @@ button:disabled { cursor: not-allowed; opacity: .55; }
 button, input, select, textarea { outline-color: #1c7c67; }
 
 .app-shell { min-height: 100vh; display: flex; }
-.sidebar { width: 232px; flex: 0 0 232px; min-height: 100vh; background: #17212b; color: #dce5e9; padding: 22px 14px 18px; display: flex; flex-direction: column; }
+.sidebar { position: sticky; top: 0; width: 232px; flex: 0 0 232px; height: 100vh; max-height: 100vh; overflow-y: auto; background: #17212b; color: #dce5e9; padding: 22px 14px 18px; display: flex; flex-direction: column; }
 .brand-row { min-height: 52px; display: flex; align-items: center; gap: 11px; padding: 0 7px 21px; border-bottom: 1px solid #31414c; }
 .brand-mark { display: grid; place-items: center; height: 31px; width: 31px; background: #e58f5a; color: #17212b; font-weight: 800; font-size: 18px; border-radius: 5px; }
 .brand-row strong { display: block; font-size: 17px; color: #fff; }
@@ -151,6 +151,8 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
 .switch-row { display: flex; align-items: center; gap: 8px; min-height: 34px; padding-top: 15px; }
 .switch-row input { width: 16px; height: 16px; accent-color: #1c7c67; }
 .switch-row span { margin: 0; color: #33454f; font-size: 13px; font-weight: 500; }
+.provider-switch-row { align-items: flex-start; }
+.provider-switch-row small { display: block; margin-top: 3px; color: #73828a; font-size: 11px; line-height: 1.4; font-weight: 400; }
 .terms-table { margin: 20px 0 10px; border: 1px solid #d7e0e3; border-radius: 5px; overflow: auto; }
 .terms-head, .term-row { min-width: 650px; display: grid; grid-template-columns: 1fr 1fr .9fr 38px; gap: 7px; align-items: center; padding: 7px 8px; }
 .terms-head { background: #f0f4f5; color: #60717b; font-size: 11px; font-weight: 700; }

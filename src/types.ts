@@ -1,4 +1,5 @@
 export type ReasoningEffort = "none" | "low" | "medium" | "high";
+export type ProxyMode = "none" | "settings" | "system";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
 export interface ProviderModel {
@@ -12,6 +13,7 @@ export interface Provider {
   baseUrl: string;
   model: string;
   apiKey: string;
+  proxyMode: ProxyMode;
   enabled: boolean;
   supportsImages: boolean;
   contextSize: number;

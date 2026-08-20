@@ -79,8 +79,8 @@ export const api = {
     request<Provider>("/providers", { method: "PUT", body: JSON.stringify(provider) }),
   deleteProvider: (id: string) => request<void>(`/providers/${id}`, { method: "DELETE" }),
   testProvider: (id: string) => request<{ message: string }>(`/providers/${id}/test`, { method: "POST" }),
-  discoverModels: (baseUrl: string, apiKey: string) =>
-    request<ProviderModel[]>("/providers/models", { method: "POST", body: JSON.stringify({ baseUrl, apiKey }) }),
+  discoverModels: (baseUrl: string, apiKey: string, proxyMode: Provider["proxyMode"]) =>
+    request<ProviderModel[]>("/providers/models", { method: "POST", body: JSON.stringify({ baseUrl, apiKey, proxyMode }) }),
   saveGlossary: (glossary: Glossary) =>
     request<Glossary>("/glossaries", { method: "PUT", body: JSON.stringify(glossary) }),
   deleteGlossary: (id: string) => request<void>(`/glossaries/${id}`, { method: "DELETE" }),

@@ -16,6 +16,7 @@ function blankProvider(): Provider {
     id: crypto.randomUUID(),
     ...DEFAULT_PROVIDER,
     apiKey: "",
+    proxyMode: "settings",
     enabled: true,
     supportsImages: false,
     contextSize: 32_768,
@@ -45,7 +46,7 @@ export function ProvidersPage({ data, onReload }: { data: BootstrapData; onReloa
     setDiscovering(true);
     setError("");
     try {
-      const nextModels = await api.discoverModels(editing.baseUrl, editing.apiKey);
+      const nextModels = await api.discoverModels(editing.baseUrl, editing.apiKey, editing.proxyMode);
       setModels(nextModels);
       const selected = nextModels.find((model) => model.id === editing.model) || nextModels[0];
       if (selected) {
@@ -117,6 +118,7 @@ export function ProvidersPage({ data, onReload }: { data: BootstrapData; onReloa
             <p className="field-hint full">{t("provider.compatibilityHint")}</p>
             <label><span>{t("common.name")}</span><input value={editing.name} onChange={(event) => setEditing({ ...editing, name: event.target.value })} /></label>
             <label><span>{t("provider.apiKey")}</span><input type="password" value={editing.apiKey} onChange={(event) => setEditing({ ...editing, apiKey: event.target.value })} placeholder={t("provider.apiKeyHint")} /></label>
+            <label><span>{t("provider.proxyMode")}</span><select value={editing.proxyMode} onChange={(event) => setEditing({ ...editing, proxyMode: event.target.value as Provider["proxyMode"] })}><option value="none">{t("provider.proxyNone")}</option><option value="settings">{t("provider.proxySettings")}</option><option value="system">{t("provider.proxySystem")}</option></select></label>
             <label className="full"><span>{t("provider.model")}</span><div className="inline-control"><input list="tranova-provider-models" value={editing.model} onChange={(event) => {
               const model = models.find((item) => item.id === event.target.value);
               setEditing({ ...editing, model: event.target.value, contextSize: model?.contextSize || editing.contextSize });
@@ -124,8 +126,8 @@ export function ProvidersPage({ data, onReload }: { data: BootstrapData; onReloa
             <label><span>{t("provider.contextSize")}</span><input type="number" min={1024} max={2000000} step={1024} value={editing.contextSize} onChange={(event) => setEditing({ ...editing, contextSize: Number(event.target.value) })} /></label>
             <label><span>{t("provider.maxSegments")}</span><input type="number" min={1} max={1024} value={editing.maxSegments} onChange={(event) => setEditing({ ...editing, maxSegments: Number(event.target.value) })} /></label>
             <label><span>{t("provider.maxConcurrent")}</span><input type="number" min={1} max={64} value={editing.maxConcurrent} onChange={(event) => setEditing({ ...editing, maxConcurrent: Number(event.target.value) })} /></label>
-            <label className="switch-row"><input type="checkbox" checked={editing.textTranslationModel} onChange={(event) => setEditing({ ...editing, textTranslationModel: event.target.checked })} /><span>{t("provider.textTranslationModel")}</span></label>
-            <label className="switch-row"><input type="checkbox" checked={editing.enabled} onChange={(event) => setEditing({ ...editing, enabled: event.target.checked })} /><span>{t("common.enabled")}</span></label>
+            <label className="switch-row provider-switch-row"><input type="checkbox" checked={editing.textTranslationModel} onChange={(event) => setEditing({ ...editing, textTranslationModel: event.target.checked })} /><div><span>{t("provider.textTranslationModel")}</span><small>{t("provider.textTranslationModelHint")}</small></div></label>
+            <label className="switch-row"><input type="checkbox" checked={editing.enabled} onChange={(event) => setEditing({ ...editing, enabled: event.target.checked })} aria-label={t("common.enabled")} /></label>
             <label className="switch-row"><input type="checkbox" checked={editing.supportsImages} onChange={(event) => setEditing({ ...editing, supportsImages: event.target.checked })} /><span>{t("provider.images")}</span></label>
           </div>
         </Modal>

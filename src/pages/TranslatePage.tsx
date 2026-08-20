@@ -100,7 +100,7 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
     providerId: defaultProvider,
     promptId: defaultPrompt,
     glossaryIds: [],
-    reasoningEffort: "medium",
+    reasoningEffort: "none",
   };
   try {
     const stored = JSON.parse(localStorage.getItem("tranova-translate-options") || "null") as Partial<TranslationOptionsValue> | null;
@@ -109,7 +109,7 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
       ...fallback,
       ...stored,
       glossaryIds: Array.isArray(stored.glossaryIds) ? stored.glossaryIds : [],
-      reasoningEffort: stored.reasoningEffort === "none" || stored.reasoningEffort === "low" || stored.reasoningEffort === "high" ? stored.reasoningEffort : "medium",
+      reasoningEffort: stored.reasoningEffort === "none" || stored.reasoningEffort === "low" || stored.reasoningEffort === "medium" || stored.reasoningEffort === "high" ? stored.reasoningEffort : "none",
     };
   } catch {
     return fallback;

@@ -361,6 +361,7 @@ fn provider_limit(store: &AppStore, provider_id: &str, priority: Priority) -> us
         base_url: String::new(),
         model: String::new(),
         api_key: String::new(),
+        proxy_mode: Default::default(),
         enabled: false,
         supports_images: false,
         context_size: 32_768,

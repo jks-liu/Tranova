@@ -69,6 +69,23 @@ pub struct FileRetryContext {
     cached_batches: HashMap<usize, CachedBatch>,
 }
 
+impl FileRetryContext {
+    pub(crate) fn new(
+        filename: &str,
+        bytes: Vec<u8>,
+        options: TranslateRequest,
+        output_mode: FileOutputMode,
+    ) -> Self {
+        Self {
+            filename: filename.to_string(),
+            bytes,
+            options,
+            output_mode,
+            cached_batches: HashMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum CachedBatch {
     Text(Vec<String>),
@@ -131,7 +148,7 @@ pub async fn translate_file_with_cancel(
     .await
 }
 
-pub async fn retry_failed_batches_with_cancel(
+pub async fn retry_file_with_cancel(
     store: &AppStore,
     scheduler: &AiScheduler,
     context: FileRetryContext,
@@ -193,8 +210,8 @@ async fn translate_file_with_cache(
         report(&counts, &progress);
         let context_limit = store
             .provider(&options.provider_id)
-            .map(|provider| (provider.context_size / 2).max(1))
-            .unwrap_or(16_384);
+            .map(|provider| (provider.context_size / 2).clamp(1, 4_096))
+            .unwrap_or(4_096);
         let sample = extract_summary_text(filename, &bytes, context_limit)?;
         if !sample.trim().is_empty() {
             let summary = tokio::select! {
@@ -809,7 +826,10 @@ async fn translate_fragments(
     ensure_not_cancelled(&state.cancel)?;
     let provider = store
         .provider(&options.provider_id)
-        .ok_or_else(|| FileError::Message("Selected AI provider was not found".to_string()))?;
+        .filter(|provider| provider.enabled)
+        .ok_or_else(|| {
+            FileError::Message("Selected AI provider does not exist or is disabled".to_string())
+        })?;
     let maximum = (provider.context_size / 4).max(256);
     let maximum_segments = provider.max_segments.max(1);
     let max_concurrent = provider.max_concurrent.max(1);
