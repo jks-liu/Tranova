@@ -124,7 +124,13 @@ Unable to summarize document: Responses API returned no output text
 The file translation failed before a result was created.
 Unable to summarize document: Responses API returned no output text
 我猜测可能是有些模型无法关闭推理
+我的建议是不使用“max_output_tokens”硬控，而是通过提示词。如果返回summary还是过长可以适当截取。
 
+### 8/28
+
+- 修复：pdf文件翻译完成后是txt文件而不是pdf
+- 语言列表中的选项应该以选线所指的语言显示
+- 语言列表不需要根据已输入内容filter选项
 
 ## TODO
 - 取消后再翻译可能有问题
