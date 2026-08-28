@@ -511,7 +511,7 @@ async fn call_responses(
     if !matches!(reasoning_effort, "" | "none") {
         body["reasoning"] = json!({ "effort": reasoning_effort });
     }
-    let client = build_client(
+    let client = build_streaming_client(
         provider.proxy_mode,
         &data.settings.proxy_url,
         data.settings.ai_timeout_seconds,
@@ -825,6 +825,23 @@ fn build_client(
     proxy_url: &str,
     timeout_seconds: u64,
 ) -> Result<Client, AiError> {
+    build_client_with_timeout(proxy_mode, proxy_url, timeout_seconds, false)
+}
+
+fn build_streaming_client(
+    proxy_mode: ProxyMode,
+    proxy_url: &str,
+    timeout_seconds: u64,
+) -> Result<Client, AiError> {
+    build_client_with_timeout(proxy_mode, proxy_url, timeout_seconds, true)
+}
+
+fn build_client_with_timeout(
+    proxy_mode: ProxyMode,
+    proxy_url: &str,
+    timeout_seconds: u64,
+    streaming: bool,
+) -> Result<Client, AiError> {
     let mut builder = Client::builder();
     match proxy_mode {
         ProxyMode::None => {
@@ -840,9 +857,14 @@ fn build_client(
         }
         ProxyMode::System => {}
     }
+    builder = builder.connect_timeout(AI_CONNECT_TIMEOUT);
+    let timeout = Duration::from_secs(timeout_seconds.max(1));
+    builder = if streaming {
+        builder.read_timeout(timeout)
+    } else {
+        builder.timeout(timeout)
+    };
     builder
-        .connect_timeout(AI_CONNECT_TIMEOUT)
-        .timeout(Duration::from_secs(timeout_seconds.max(1)))
         .build()
         .map_err(|error| request_error("building HTTP client", error))
 }
@@ -992,12 +1014,17 @@ fn unix_timestamp_nanos() -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{convert::Infallible, time::Duration};
+
+    use axum::{body::Bytes, routing::post, Router};
     use serde_json::json;
+    use tokio_stream::wrappers::UnboundedReceiverStream;
 
     use super::{
-        append_response_stream_line, decode_responses_image, document_summary_request,
-        parse_batch_response, truncate_document_summary, TranslateRequest,
-        MAX_DOCUMENT_SUMMARY_CHARS, SEGMENT_SEPARATOR,
+        append_response_stream_line, build_streaming_client, decode_responses_image,
+        document_summary_request, parse_batch_response, send_responses_request,
+        truncate_document_summary, ProxyMode, TranslateRequest, MAX_DOCUMENT_SUMMARY_CHARS,
+        SEGMENT_SEPARATOR,
     };
 
     #[test]
@@ -1061,6 +1088,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(content, "Hello");
+    }
+
+    #[tokio::test]
+    async fn streaming_timeout_resets_after_each_received_chunk() {
+        async fn delayed_stream() -> axum::body::Body {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            tokio::spawn(async move {
+                let chunks = [
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hel\"}\n\n"
+                        .as_slice(),
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"l\"}\n\n"
+                        .as_slice(),
+                    b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"o\"}\n\n"
+                        .as_slice(),
+                ];
+                for (index, chunk) in chunks.into_iter().enumerate() {
+                    if index > 0 {
+                        tokio::time::sleep(Duration::from_millis(600)).await;
+                    }
+                    if sender
+                        .send(Ok::<_, Infallible>(Bytes::copy_from_slice(chunk)))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            axum::body::Body::from_stream(UnboundedReceiverStream::new(receiver))
+        }
+
+        let app = Router::new().route("/responses", post(delayed_stream));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = build_streaming_client(ProxyMode::None, "", 1).unwrap();
+        let started = std::time::Instant::now();
+
+        let result = send_responses_request(
+            &client,
+            &format!("http://{address}/responses"),
+            &json!({}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        server.abort();
+        assert_eq!(result, "Hello");
+        assert!(started.elapsed() > Duration::from_secs(1));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "tranova"
-version = "0.1.5"
+version = "0.1.6"
 description = "AI translation studio for text and documents"
 authors = ["Tranova contributors"]
 edition = "2021"

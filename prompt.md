@@ -133,9 +133,11 @@ Unable to summarize document: Responses API returned no output text
 - 语言列表不需要根据已输入内容filter选项
 - 修复：AI providers设置中有一个悬空的checkbox无任何文字
 
+- 当AI是流式输出时，每当接收到消息时超时时间应该重置
+
 ## TODO
 - 取消后再翻译可能有问题
 
 
-- 当AI是流式输出时，每当接收到消息时超时时间应该重置
+
 
