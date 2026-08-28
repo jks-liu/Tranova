@@ -127,7 +127,7 @@ export function ProvidersPage({ data, onReload }: { data: BootstrapData; onReloa
             <label><span>{t("provider.maxSegments")}</span><input type="number" min={1} max={1024} value={editing.maxSegments} onChange={(event) => setEditing({ ...editing, maxSegments: Number(event.target.value) })} /></label>
             <label><span>{t("provider.maxConcurrent")}</span><input type="number" min={1} max={64} value={editing.maxConcurrent} onChange={(event) => setEditing({ ...editing, maxConcurrent: Number(event.target.value) })} /></label>
             <label className="switch-row provider-switch-row"><input type="checkbox" checked={editing.textTranslationModel} onChange={(event) => setEditing({ ...editing, textTranslationModel: event.target.checked })} /><div><span>{t("provider.textTranslationModel")}</span><small>{t("provider.textTranslationModelHint")}</small></div></label>
-            <label className="switch-row"><input type="checkbox" checked={editing.enabled} onChange={(event) => setEditing({ ...editing, enabled: event.target.checked })} aria-label={t("common.enabled")} /></label>
+            <label className="switch-row"><input type="checkbox" checked={editing.enabled} onChange={(event) => setEditing({ ...editing, enabled: event.target.checked })} /><span>{t("common.enabled")}</span></label>
             <label className="switch-row"><input type="checkbox" checked={editing.supportsImages} onChange={(event) => setEditing({ ...editing, supportsImages: event.target.checked })} /><span>{t("provider.images")}</span></label>
           </div>
         </Modal>

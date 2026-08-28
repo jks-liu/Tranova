@@ -1,8 +1,9 @@
-import { ArrowLeftRight } from "lucide-react";
+import { ArrowLeftRight, ChevronDown } from "lucide-react";
+import { useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { Glossary, PromptTemplate, Provider, ReasoningEffort } from "../types";
 
-const LANGUAGES = ["en", "zh", "ja", "ko", "fr", "de", "es", "ru"];
+const LANGUAGES = ["en", "zh-CN", "zh-TW", "ja", "ko", "fr", "de", "es", "ru", "ar", "tlh", "martian"];
 
 export interface TranslationOptionsValue {
   sourceLanguage: string;
@@ -38,7 +39,6 @@ export function TranslationOptions({ value, onChange, providers, prompts, glossa
         <LanguageInput
           label={t("translate.sourceLanguage")}
           value={value.sourceLanguage}
-          listId="tranova-source-languages"
           allowAuto
           onChange={(sourceLanguage) => update({ sourceLanguage })}
         />
@@ -55,9 +55,9 @@ export function TranslationOptions({ value, onChange, providers, prompts, glossa
         <LanguageInput
           label={t("translate.targetLanguage")}
           value={value.targetLanguage}
-          listId="tranova-target-languages"
           onChange={(targetLanguage) => update({ targetLanguage })}
         />
+        <small className="language-custom-hint">{t("languages.customHint")}</small>
       </div>
       <label>
         <span>{t("translate.provider")}</span>
@@ -100,31 +100,96 @@ export function TranslationOptions({ value, onChange, providers, prompts, glossa
 function LanguageInput({
   label,
   value,
-  listId,
   allowAuto = false,
   onChange,
 }: {
   label: string;
   value: string;
-  listId: string;
   allowAuto?: boolean;
   onChange: (value: string) => void;
 }) {
   const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const inputId = useId();
+  const listId = useId();
+  const languages = allowAuto ? ["auto", ...LANGUAGES] : LANGUAGES;
+  const selectedLanguage = value === "zh" ? "zh-CN" : value;
+  const displayValue = languages.includes(selectedLanguage)
+    ? t(`languages.${selectedLanguage}`)
+    : value;
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOnOutsideClick = (event: PointerEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsideClick);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeOnOutsideClick);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
   return (
-    <label className="language-input">
-      <span>{label}</span>
-      <input
-        list={listId}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-        placeholder={t("languages.customPlaceholder")}
-        spellCheck={false}
-      />
-      <datalist id={listId}>
-        {allowAuto && <option value="auto" label={t("languages.auto")} />}
-        {LANGUAGES.map((language) => <option key={language} value={language} label={t(`languages.${language}`)} />)}
-      </datalist>
-    </label>
+    <div className="language-input" ref={rootRef}>
+      <label htmlFor={inputId}>{label}</label>
+      <div className="language-combobox">
+        <input
+          id={inputId}
+          value={displayValue}
+          onChange={(event) => {
+            onChange(event.target.value);
+            setOpen(true);
+          }}
+          onFocus={() => setOpen(true)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown") setOpen(true);
+          }}
+          placeholder={t("languages.customPlaceholder")}
+          spellCheck={false}
+          role="combobox"
+          aria-autocomplete="none"
+          aria-expanded={open}
+          aria-controls={listId}
+        />
+        <button
+          className="language-list-button"
+          type="button"
+          onClick={() => setOpen((current) => !current)}
+          aria-label={t("languages.showOptions")}
+          aria-expanded={open}
+          aria-controls={listId}
+          tabIndex={-1}
+        >
+          <ChevronDown size={16} />
+        </button>
+        {open && (
+          <div className="language-options" id={listId} role="listbox">
+            {languages.map((language) => (
+              <button
+                type="button"
+                role="option"
+                aria-selected={selectedLanguage === language}
+                className={selectedLanguage === language ? "selected" : ""}
+                key={language}
+                onMouseDown={(event) => event.preventDefault()}
+                onClick={() => {
+                  onChange(language);
+                  setOpen(false);
+                }}
+              >
+                <span>{t(`languages.${language}`)}</span>
+                <small>{language}</small>
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

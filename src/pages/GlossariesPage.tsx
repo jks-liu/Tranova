@@ -7,7 +7,7 @@ import type { BootstrapData, Glossary } from "../types";
 import { downloadJson, nowIso, readJsonFile } from "../utils";
 
 function blankGlossary(): Glossary {
-  return { id: crypto.randomUUID(), name: "", sourceLanguage: "auto", targetLanguage: "zh", entries: [], updatedAt: nowIso() };
+  return { id: crypto.randomUUID(), name: "", sourceLanguage: "auto", targetLanguage: "zh-CN", entries: [], updatedAt: nowIso() };
 }
 
 export function GlossariesPage({ data, onReload }: { data: BootstrapData; onReload: () => Promise<void> }) {

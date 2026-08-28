@@ -34,3 +34,32 @@ test("Simplified Chinese interface localizes the primary workflow", async ({ pag
   await expect(page.locator(".sidebar-nav")).toContainText("文件翻译");
   await expect(page.locator(".brand-row")).toContainText("AI 翻译工作台");
 });
+
+test("language options use native names and stay visible while typing", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("tranova-language", "en"));
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+
+  const sourceLanguage = page.getByRole("combobox", { name: "Source language" });
+  const targetLanguage = page.getByRole("combobox", { name: "Target language" });
+  await expect(targetLanguage).toHaveValue("简体中文");
+  await targetLanguage.click();
+  await targetLanguage.locator("..").getByRole("option", { name: "繁體中文 zh-TW" }).click();
+  await expect(targetLanguage).toHaveValue("繁體中文");
+
+  await sourceLanguage.fill("custom language");
+  const options = sourceLanguage.locator("..").getByRole("option");
+  await expect(options).toHaveCount(13);
+  await expect(options).toContainText(["Auto detect", "English", "简体中文", "繁體中文", "日本語", "한국어", "Français", "Deutsch", "Español", "Русский", "العربية", "tlhIngan Hol", "吙煋呅（火星文）"]);
+  await expect(page.locator(".translate-page .language-custom-hint")).toHaveText("You can also enter any language directly.");
+});
+
+test("provider enabled checkbox has a visible label", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("tranova-language", "en"));
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await page.getByRole("button", { name: "AI providers" }).click();
+  await page.getByRole("button", { name: "Add provider" }).click();
+
+  const enabled = page.getByRole("checkbox", { name: "Enabled", exact: true });
+  await expect(page.getByText("Enabled", { exact: true })).toBeVisible();
+  await expect(enabled).toBeChecked();
+});

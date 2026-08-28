@@ -59,7 +59,18 @@ textarea { padding: 12px; resize: vertical; line-height: 1.55; }
 .glossary-picker legend { padding: 0; }
 .glossary-picker > div { min-height: 36px; display: flex; align-items: center; gap: 9px; overflow-x: auto; }
 .language-pair { min-width: 0; display: grid; grid-template-columns: minmax(0, 1fr) 34px minmax(0, 1fr); align-items: end; gap: 7px; }
-.language-input { min-width: 0; }
+.language-input { min-width: 0; position: relative; }
+.language-input > label { display: block; color: #60717b; font-size: 12px; font-weight: 600; margin-bottom: 6px; }
+.language-combobox { position: relative; }
+.language-combobox input { padding-right: 34px; }
+.language-list-button { position: absolute; top: 1px; right: 1px; width: 32px; height: 34px; display: grid; place-items: center; padding: 0; color: #657680; background: transparent; border: 0; border-left: 1px solid #dce3e6; border-radius: 0 3px 3px 0; }
+.language-list-button:hover { color: #1b2733; background: #edf2f3; }
+.language-options { position: absolute; z-index: 10; top: calc(100% + 4px); left: 0; right: 0; max-height: 250px; overflow-y: auto; padding: 4px; background: #fff; border: 1px solid #becbd0; border-radius: 4px; box-shadow: 0 9px 24px rgb(24 38 47 / .18); }
+.language-options button { width: 100%; min-height: 34px; display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 6px 8px; color: #263944; background: transparent; border: 0; border-radius: 3px; text-align: left; }
+.language-options button:hover, .language-options button.selected { background: #e8f3ef; color: #176b5a; }
+.language-options span { margin: 0; color: inherit; font-size: 13px; font-weight: 500; }
+.language-options small { color: #809098; font-size: 11px; }
+.language-custom-hint { grid-column: 1 / -1; color: #708089; font-size: 11px; line-height: 1.35; }
 .language-swap { margin-bottom: 1px; }
 .check-row { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; color: #33454f; font-size: 12px; }
 .check-row input { height: 14px; width: 14px; accent-color: #1c7c67; }

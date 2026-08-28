@@ -128,10 +128,14 @@ Unable to summarize document: Responses API returned no output text
 
 ### 8/28
 
-- 修复：pdf文件翻译完成后是txt文件而不是pdf
-- 语言列表中的选项应该以选线所指的语言显示
+- 修复：pdf文件翻译完成后是txt文件而不是pdf。请确保文件翻译完还是同类型文件
+- 语言列表中的选项应该以选项所指的语言显示
 - 语言列表不需要根据已输入内容filter选项
+- 修复：AI providers设置中有一个悬空的checkbox无任何文字
 
 ## TODO
 - 取消后再翻译可能有问题
+
+
+- 当AI是流式输出时，每当接收到消息时超时时间应该重置
 

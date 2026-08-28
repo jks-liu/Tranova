@@ -1,9 +1,13 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     io::{Cursor, Read, Write},
     sync::Arc,
 };
 
+use fontdb::{Database as FontDatabase, Family as FontFamily, Query as FontQuery, Style};
+use printpdf::{
+    FontId, Mm, Op, ParsedFont, PdfDocument, PdfPage, PdfSaveOptions, Point, Pt, TextItem,
+};
 use quick_xml::{
     escape::{escape, unescape},
     events::{BytesText, Event},
@@ -509,7 +513,7 @@ async fn translate_pdf(
 ) -> Result<Vec<u8>, FileError> {
     let text = pdf_extract::extract_text_from_mem(bytes)
         .map_err(|error| FileError::Message(format!("Unable to extract PDF text: {error}")))?;
-    Ok(translate_lines(
+    let translated = translate_lines(
         store,
         scheduler,
         &text,
@@ -520,8 +524,287 @@ async fn translate_pdf(
         state,
         |line| !line.trim().is_empty(),
     )
-    .await?
-    .into_bytes())
+    .await?;
+    render_translated_pdf(&translated)
+}
+
+const PDF_FONT_SIZE: f32 = 11.0;
+const PDF_LINE_HEIGHT: f32 = 15.0;
+const PDF_LINES_PER_PAGE: usize = 48;
+const PDF_LINE_WIDTH_UNITS: usize = 88;
+
+struct PdfFont {
+    parsed: ParsedFont,
+    id: FontId,
+}
+
+fn render_translated_pdf(text: &str) -> Result<Vec<u8>, FileError> {
+    let mut document = PdfDocument::new("Tranova translated document");
+    let parsed_fonts = load_pdf_fonts(text)?;
+    let fonts = parsed_fonts
+        .into_iter()
+        .map(|parsed| {
+            let id = document.add_font(&parsed);
+            PdfFont { parsed, id }
+        })
+        .collect::<Vec<_>>();
+    let lines = wrap_pdf_text(text);
+    let pages = lines
+        .chunks(PDF_LINES_PER_PAGE)
+        .map(|page_lines| build_pdf_page(page_lines, &fonts))
+        .collect::<Vec<_>>();
+    let mut warnings = Vec::new();
+    let bytes = document
+        .with_pages(if pages.is_empty() {
+            vec![build_pdf_page(&[String::new()], &fonts)]
+        } else {
+            pages
+        })
+        .save(&PdfSaveOptions::default(), &mut warnings);
+    if bytes.starts_with(b"%PDF-") {
+        Ok(bytes)
+    } else {
+        Err(FileError::Message(
+            "Unable to build translated PDF".to_string(),
+        ))
+    }
+}
+
+fn load_pdf_fonts(text: &str) -> Result<Vec<ParsedFont>, FileError> {
+    let required = text
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect::<BTreeSet<_>>();
+    if required.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut database = FontDatabase::new();
+    database.load_system_fonts();
+
+    let preferred_families = [
+        "Noto Sans CJK SC",
+        "Noto Sans SC",
+        "Microsoft YaHei",
+        "DengXian",
+        "SimHei",
+        "PingFang SC",
+        "Noto Sans CJK JP",
+        "Noto Sans JP",
+        "Yu Gothic",
+        "Meiryo",
+        "Hiragino Sans",
+        "Noto Sans CJK KR",
+        "Noto Sans KR",
+        "Malgun Gothic",
+        "Apple SD Gothic Neo",
+        "Arial Unicode MS",
+        "Noto Sans",
+        "DejaVu Sans",
+        "Liberation Sans",
+        "Arial",
+    ];
+    let mut preferred_ids = Vec::new();
+    for family in preferred_families {
+        if let Some(id) = database.query(&FontQuery {
+            families: &[FontFamily::Name(family)],
+            ..FontQuery::default()
+        }) {
+            if !preferred_ids.contains(&id) {
+                preferred_ids.push(id);
+            }
+        }
+    }
+    if let Some(id) = database.query(&FontQuery {
+        families: &[FontFamily::SansSerif],
+        ..FontQuery::default()
+    }) {
+        if !preferred_ids.contains(&id) {
+            preferred_ids.push(id);
+        }
+    }
+
+    let all_ids = database
+        .faces()
+        .filter(|face| face.style == Style::Normal)
+        .map(|face| face.id)
+        .collect::<Vec<_>>();
+    let mut remaining = required;
+    let mut used_ids = Vec::new();
+    let mut fonts = Vec::new();
+    while !remaining.is_empty() {
+        let selected = if fonts.is_empty() {
+            best_pdf_font(&database, &preferred_ids, &used_ids, &remaining)
+                .or_else(|| best_pdf_font(&database, &all_ids, &used_ids, &remaining))
+        } else {
+            best_pdf_font(&database, &all_ids, &used_ids, &remaining)
+        };
+        let Some((id, font, covered)) = selected else {
+            break;
+        };
+        used_ids.push(id);
+        for character in covered {
+            remaining.remove(&character);
+        }
+        fonts.push(font);
+    }
+
+    if !remaining.is_empty() {
+        let missing = remaining.iter().take(8).collect::<String>();
+        return Err(FileError::Message(format!(
+            "Unable to build translated PDF because no installed font supports: {missing}"
+        )));
+    }
+    Ok(fonts)
+}
+
+fn best_pdf_font(
+    database: &FontDatabase,
+    candidates: &[fontdb::ID],
+    used_ids: &[fontdb::ID],
+    required: &BTreeSet<char>,
+) -> Option<(fontdb::ID, ParsedFont, BTreeSet<char>)> {
+    let mut best = None;
+    for id in candidates
+        .iter()
+        .copied()
+        .filter(|id| !used_ids.contains(id))
+    {
+        let Some(Some(parsed)) = database.with_face_data(id, |bytes, index| {
+            ParsedFont::from_bytes(bytes, index as usize, &mut Vec::new())
+        }) else {
+            continue;
+        };
+        let covered = required
+            .iter()
+            .copied()
+            .filter(|character| parsed.lookup_glyph_index(*character as u32).is_some())
+            .collect::<BTreeSet<_>>();
+        if covered.is_empty() {
+            continue;
+        }
+        let is_better = best
+            .as_ref()
+            .map(
+                |(_, _, best_covered): &(fontdb::ID, ParsedFont, BTreeSet<char>)| {
+                    covered.len() > best_covered.len()
+                },
+            )
+            .unwrap_or(true);
+        if is_better {
+            let covers_everything = covered.len() == required.len();
+            best = Some((id, parsed, covered));
+            if covers_everything {
+                break;
+            }
+        }
+    }
+    best
+}
+
+fn build_pdf_page(lines: &[String], fonts: &[PdfFont]) -> PdfPage {
+    let mut operations = vec![
+        Op::StartTextSection,
+        Op::SetTextCursor {
+            pos: Point::new(Mm(18.0), Mm(279.0)),
+        },
+        Op::SetLineHeight {
+            lh: Pt(PDF_LINE_HEIGHT),
+        },
+    ];
+    for line in lines {
+        for (font_index, text) in pdf_font_runs(line, fonts) {
+            let font = fonts[font_index].id.clone();
+            operations.push(Op::SetFontSize {
+                size: Pt(PDF_FONT_SIZE),
+                font: font.clone(),
+            });
+            operations.push(Op::WriteText {
+                items: vec![TextItem::Text(text)],
+                font,
+            });
+        }
+        operations.push(Op::AddLineBreak);
+    }
+    operations.push(Op::EndTextSection);
+    PdfPage::new(Mm(210.0), Mm(297.0), operations)
+}
+
+fn pdf_font_runs(line: &str, fonts: &[PdfFont]) -> Vec<(usize, String)> {
+    let mut runs: Vec<(usize, String)> = Vec::new();
+    for character in line.chars() {
+        let font_index = fonts
+            .iter()
+            .position(|font| font.parsed.lookup_glyph_index(character as u32).is_some())
+            .unwrap_or(0);
+        if let Some((last_font, text)) = runs.last_mut() {
+            if *last_font == font_index {
+                text.push(character);
+                continue;
+            }
+        }
+        runs.push((font_index, character.to_string()));
+    }
+    runs
+}
+
+fn wrap_pdf_text(text: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for source_line in text.split('\n') {
+        let characters = source_line
+            .trim_end_matches('\r')
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<Vec<_>>();
+        if characters.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut start = 0;
+        while start < characters.len() {
+            let mut width = 0;
+            let mut end = start;
+            let mut whitespace = None;
+            while end < characters.len() {
+                let next_width = pdf_character_width(characters[end]);
+                if end > start && width + next_width > PDF_LINE_WIDTH_UNITS {
+                    break;
+                }
+                width += next_width;
+                if characters[end].is_whitespace() {
+                    whitespace = Some(end);
+                }
+                end += 1;
+            }
+            if end < characters.len() {
+                if let Some(index) = whitespace.filter(|index| *index > start) {
+                    end = index;
+                }
+            }
+            lines.push(characters[start..end].iter().collect());
+            start = end;
+            while start < characters.len() && characters[start].is_whitespace() {
+                start += 1;
+            }
+        }
+    }
+    lines
+}
+
+fn pdf_character_width(character: char) -> usize {
+    if matches!(
+        character as u32,
+        0x1100..=0x11ff
+            | 0x2e80..=0xa4cf
+            | 0xac00..=0xd7af
+            | 0xf900..=0xfaff
+            | 0xfe10..=0xfe6f
+            | 0xff00..=0xffef
+            | 0x1f000..=0x1faff
+    ) {
+        2
+    } else {
+        1
+    }
 }
 
 fn extract_summary_text(filename: &str, bytes: &[u8], maximum: usize) -> Result<String, FileError> {
@@ -1643,42 +1926,21 @@ fn translated_filename(filename: &str) -> String {
 }
 
 fn output_filename(filename: &str) -> String {
-    if filename
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .eq_ignore_ascii_case("pdf")
-    {
-        let stem = filename
-            .rsplit_once('.')
-            .map(|(stem, _)| stem)
-            .unwrap_or(filename);
-        format!("{stem}-translated.txt")
-    } else {
-        translated_filename(filename)
-    }
+    translated_filename(filename)
 }
 
 fn output_media_type(filename: &str) -> String {
-    if filename
-        .rsplit('.')
-        .next()
-        .unwrap_or("")
-        .eq_ignore_ascii_case("pdf")
-    {
-        "text/plain; charset=utf-8".to_string()
-    } else {
-        mime_guess::from_path(filename)
-            .first_or_octet_stream()
-            .to_string()
-    }
+    mime_guess::from_path(filename)
+        .first_or_octet_stream()
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        make_batches, partial_batch_item_count, render_fragment, replace_xml_text, split_chunks,
-        surrounding_whitespace, PendingPart,
+        make_batches, output_filename, output_media_type, partial_batch_item_count,
+        render_fragment, render_translated_pdf, replace_xml_text, split_chunks,
+        surrounding_whitespace, wrap_pdf_text, PendingPart,
     };
     use crate::{ai::SEGMENT_SEPARATOR, models::FileOutputMode};
 
@@ -1751,5 +2013,28 @@ mod tests {
             partial_batch_item_count(&format!("first{SEGMENT_SEPARATOR}second")),
             2
         );
+    }
+
+    #[test]
+    fn pdf_output_keeps_its_file_type() {
+        assert_eq!(output_filename("guide.PDF"), "guide-translated.PDF");
+        assert_eq!(output_media_type("guide.PDF"), "application/pdf");
+    }
+
+    #[test]
+    fn translated_pdf_is_valid_and_contains_the_translation() {
+        let pdf = render_translated_pdf("Translated PDF\nSecond line").unwrap();
+        assert!(pdf.starts_with(b"%PDF-"));
+        let extracted = pdf_extract::extract_text_from_mem(&pdf).unwrap();
+        assert!(extracted.contains("Translated PDF"));
+        assert!(extracted.contains("Second line"));
+    }
+
+    #[test]
+    fn pdf_text_wraps_long_lines_without_losing_characters() {
+        let text = "一".repeat(100);
+        let lines = wrap_pdf_text(&text);
+        assert!(lines.len() > 1);
+        assert_eq!(lines.concat(), text);
     }
 }

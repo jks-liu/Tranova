@@ -96,7 +96,7 @@ export function TranslatePage({ data, onReload }: { data: BootstrapData; onReloa
 function readOptions(defaultProvider: string, defaultPrompt: string): TranslationOptionsValue {
   const fallback: TranslationOptionsValue = {
     sourceLanguage: "auto",
-    targetLanguage: "zh",
+    targetLanguage: "zh-CN",
     providerId: defaultProvider,
     promptId: defaultPrompt,
     glossaryIds: [],
@@ -105,9 +105,13 @@ function readOptions(defaultProvider: string, defaultPrompt: string): Translatio
   try {
     const stored = JSON.parse(localStorage.getItem("tranova-translate-options") || "null") as Partial<TranslationOptionsValue> | null;
     if (!stored || typeof stored !== "object") return fallback;
+    const sourceLanguage = stored.sourceLanguage === "zh" ? "zh-CN" : stored.sourceLanguage;
+    const targetLanguage = stored.targetLanguage === "zh" ? "zh-CN" : stored.targetLanguage;
     return {
       ...fallback,
       ...stored,
+      ...(sourceLanguage ? { sourceLanguage } : {}),
+      ...(targetLanguage ? { targetLanguage } : {}),
       glossaryIds: Array.isArray(stored.glossaryIds) ? stored.glossaryIds : [],
       reasoningEffort: stored.reasoningEffort === "none" || stored.reasoningEffort === "low" || stored.reasoningEffort === "medium" || stored.reasoningEffort === "high" ? stored.reasoningEffort : "none",
     };
