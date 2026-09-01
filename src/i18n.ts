@@ -15,7 +15,7 @@ const resources = {
       history: { title: "Translation history", subtitle: "Review recent text and file translation jobs.", empty: "No translation history yet", clear: "Clear history", remove: "Remove from history", source: "Source", translation: "Translation", file: "File", text: "Text", segments: "File translation" },
       logs: { title: "Logs", subtitle: "Inspect application events and AI conversations.", system: "System logs", conversations: "AI conversations", empty: "No logs yet", success: "Success", failure: "Failed", request: "Request", response: "Response" },
       status: { backendUnavailable: "Tranova service is unavailable. Start the desktop app or server.", noProvider: "Configure and enable an AI provider first.", saved: "Saved", imported: "Imported successfully" },
-      languages: { en: "English", zh: "简体中文", "zh-CN": "简体中文", "zh-TW": "繁體中文", ja: "日本語", ko: "한국어", fr: "Français", de: "Deutsch", es: "Español", ru: "Русский", ar: "العربية", tlh: "tlhIngan Hol", martian: "吙煋呅（火星文）", auto: "Auto detect", customPlaceholder: "Enter a language", customHint: "You can also enter any language directly.", showOptions: "Show all languages" }
+      languages: { en: "English", zh: "简体中文", "zh-CN": "简体中文", "zh-TW": "繁體中文", ja: "日本語", ko: "한국어", fr: "Français", de: "Deutsch", es: "Español", ru: "Русский", ar: "العربية", tlh: "tlhIngan Hol", "火星文": "吙煋呅", auto: "Auto detect", customPlaceholder: "Enter a language", customHint: "You can also enter any language directly.", showOptions: "Show all languages" }
     },
   },
   "zh-CN": {
@@ -31,7 +31,7 @@ const resources = {
       history: { title: "翻译历史", subtitle: "查看最近的文本和文件翻译记录。", empty: "还没有翻译记录", clear: "清空历史记录", remove: "移除记录", source: "原文", translation: "译文", file: "文件", text: "文本", segments: "文件翻译" },
       logs: { title: "日志", subtitle: "查看应用事件和与 AI 的对话内容。", system: "系统日志", conversations: "AI 对话", empty: "暂无日志", success: "成功", failure: "失败", request: "请求内容", response: "返回内容" },
       status: { backendUnavailable: "Tranova 服务不可用，请启动桌面应用或服务器。", noProvider: "请先配置并启用一个 AI 服务。", saved: "已保存", imported: "导入成功" },
-      languages: { en: "English", zh: "简体中文", "zh-CN": "简体中文", "zh-TW": "繁體中文", ja: "日本語", ko: "한국어", fr: "Français", de: "Deutsch", es: "Español", ru: "Русский", ar: "العربية", tlh: "tlhIngan Hol", martian: "吙煋呅（火星文）", auto: "自动检测", customPlaceholder: "输入语言名称", customHint: "也可以直接输入任意语言名称。", showOptions: "显示全部语言" }
+      languages: { en: "English", zh: "简体中文", "zh-CN": "简体中文", "zh-TW": "繁體中文", ja: "日本語", ko: "한국어", fr: "Français", de: "Deutsch", es: "Español", ru: "Русский", ar: "العربية", tlh: "tlhIngan Hol", "火星文": "吙煋呅", auto: "自动检测", customPlaceholder: "输入语言名称", customHint: "也可以直接输入任意语言名称。", showOptions: "显示全部语言" }
     },
   },
 } as const;

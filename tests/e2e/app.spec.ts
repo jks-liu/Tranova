@@ -49,7 +49,7 @@ test("language options use native names and stay visible while typing", async ({
   await sourceLanguage.fill("custom language");
   const options = sourceLanguage.locator("..").getByRole("option");
   await expect(options).toHaveCount(13);
-  await expect(options).toContainText(["Auto detect", "English", "简体中文", "繁體中文", "日本語", "한국어", "Français", "Deutsch", "Español", "Русский", "العربية", "tlhIngan Hol", "吙煋呅（火星文）"]);
+  await expect(options).toContainText(["Auto detect", "English", "简体中文", "繁體中文", "日本語", "한국어", "Français", "Deutsch", "Español", "Русский", "العربية", "tlhIngan Hol", "吙煋呅"]);
   await expect(page.locator(".translate-page .language-custom-hint")).toHaveText("You can also enter any language directly.");
 });
 
