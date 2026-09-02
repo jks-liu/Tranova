@@ -3,7 +3,7 @@ import { useEffect, useId, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { Glossary, PromptTemplate, Provider, ReasoningEffort } from "../types";
 
-const LANGUAGES = ["en", "zh-CN", "zh-TW", "ja", "ko", "fr", "de", "es", "ru", "ar", "tlh", "martian"];
+const LANGUAGES = ["en", "zh-CN", "zh-TW", "ja", "ko", "fr", "de", "es", "ru", "ar", "tlh", "火星文"];
 
 export interface TranslationOptionsValue {
   sourceLanguage: string;
