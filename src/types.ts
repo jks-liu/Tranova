@@ -1,4 +1,5 @@
 export type ReasoningEffort = "none" | "low" | "medium" | "high";
+export type ReasoningParser = "auto" | "openai" | "qwen3" | "deepseek_r1" | "deepseek_v3" | "glm45" | "gemma4" | "granite";
 export type ProxyMode = "none" | "settings" | "system";
 export type LogLevel = "debug" | "info" | "warn" | "error";
 
@@ -12,6 +13,7 @@ export interface Provider {
   name: string;
   baseUrl: string;
   model: string;
+  reasoningParser: ReasoningParser;
   apiKey: string;
   proxyMode: ProxyMode;
   enabled: boolean;

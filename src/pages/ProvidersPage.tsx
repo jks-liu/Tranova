@@ -15,6 +15,7 @@ function blankProvider(): Provider {
   return {
     id: crypto.randomUUID(),
     ...DEFAULT_PROVIDER,
+    reasoningParser: "auto",
     apiKey: "",
     proxyMode: "settings",
     enabled: true,
@@ -123,6 +124,7 @@ export function ProvidersPage({ data, onReload }: { data: BootstrapData; onReloa
               const model = models.find((item) => item.id === event.target.value);
               setEditing({ ...editing, model: event.target.value, contextSize: model?.contextSize || editing.contextSize });
             }} /><button className="icon-text-button compact" type="button" onClick={() => void discover()} disabled={discovering || !editing.baseUrl} title={t("provider.discoverModels")}><Search size={16} /> {discovering ? t("provider.discovering") : t("provider.discoverModels")}</button></div><datalist id="tranova-provider-models">{models.map((model) => <option value={model.id} key={model.id}>{model.contextSize ? `${model.id} (${model.contextSize.toLocaleString()})` : model.id}</option>)}</datalist></label>
+            <label className="full"><span>{t("provider.reasoningParser")}</span><select value={editing.reasoningParser} onChange={(event) => setEditing({ ...editing, reasoningParser: event.target.value as Provider["reasoningParser"] })}><option value="auto">{t("provider.reasoningParserAuto")}</option><option value="openai">OpenAI Responses API</option><option value="qwen3">qwen3</option><option value="deepseek_r1">deepseek_r1</option><option value="deepseek_v3">deepseek_v3</option><option value="glm45">glm45</option><option value="gemma4">gemma4</option><option value="granite">granite</option></select><small className="field-hint">{t("provider.reasoningParserHint")}</small></label>
             <label><span>{t("provider.contextSize")}</span><input type="number" min={1024} max={2000000} step={1024} value={editing.contextSize} onChange={(event) => setEditing({ ...editing, contextSize: Number(event.target.value) })} /></label>
             <label><span>{t("provider.maxSegments")}</span><input type="number" min={1} max={1024} value={editing.maxSegments} onChange={(event) => setEditing({ ...editing, maxSegments: Number(event.target.value) })} /></label>
             <label><span>{t("provider.maxConcurrent")}</span><input type="number" min={1} max={64} value={editing.maxConcurrent} onChange={(event) => setEditing({ ...editing, maxConcurrent: Number(event.target.value) })} /></label>

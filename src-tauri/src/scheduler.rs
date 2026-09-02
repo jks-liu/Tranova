@@ -360,6 +360,7 @@ fn provider_limit(store: &AppStore, provider_id: &str, priority: Priority) -> us
         name: String::new(),
         base_url: String::new(),
         model: String::new(),
+        reasoning_parser: Default::default(),
         api_key: String::new(),
         proxy_mode: Default::default(),
         enabled: false,

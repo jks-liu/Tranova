@@ -8,6 +8,8 @@ pub struct Provider {
     pub base_url: String,
     pub model: String,
     #[serde(default)]
+    pub reasoning_parser: ReasoningParser,
+    #[serde(default)]
     pub api_key: String,
     #[serde(default)]
     pub proxy_mode: ProxyMode,
@@ -23,6 +25,20 @@ pub struct Provider {
     pub max_concurrent: usize,
     #[serde(default)]
     pub text_translation_model: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningParser {
+    #[default]
+    Auto,
+    Openai,
+    Qwen3,
+    DeepseekR1,
+    DeepseekV3,
+    Glm45,
+    Gemma4,
+    Granite,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -259,7 +275,9 @@ impl TranslateOptions {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppSettings, DownloadLocation, Provider, ProxyMode, TranslateOptions};
+    use super::{
+        AppSettings, DownloadLocation, Provider, ProxyMode, ReasoningParser, TranslateOptions,
+    };
 
     #[test]
     fn settings_default_timeout_is_180_seconds() {
@@ -295,6 +313,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(provider.proxy_mode, ProxyMode::Settings);
+        assert_eq!(provider.reasoning_parser, ReasoningParser::Auto);
     }
 }
 

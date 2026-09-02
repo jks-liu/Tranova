@@ -14,8 +14,8 @@ use thiserror::Error;
 
 use crate::{
     models::{
-        AiConversationLog, AppData, Provider, ProviderModel, ProxyMode, TranslateRequest,
-        TranslationResult,
+        AiConversationLog, AppData, Provider, ProviderModel, ProxyMode, ReasoningParser,
+        TranslateRequest, TranslationResult,
     },
     store::AppStore,
 };
@@ -360,7 +360,7 @@ async fn translate_with_data_instruction(
     }
     let started = Instant::now();
     let request_for_log = format!("SYSTEM:\n{system}\n\nUSER:\n{user}");
-    let response = call_responses(
+    let response = call_text_model(
         data,
         provider,
         &system,
@@ -494,6 +494,162 @@ fn build_messages(data: &AppData, request: &TranslateRequest) -> (String, String
     (system, user)
 }
 
+async fn call_text_model(
+    data: &AppData,
+    provider: &Provider,
+    system: &str,
+    user: &str,
+    reasoning_effort: &str,
+    stream: Option<StreamCallback>,
+) -> Result<String, AiError> {
+    let parser = resolve_reasoning_parser(provider);
+    if parser == ReasoningParser::Openai {
+        call_responses(data, provider, system, user, reasoning_effort, stream).await
+    } else {
+        call_chat_completions(
+            data,
+            provider,
+            parser,
+            system,
+            user,
+            reasoning_effort,
+            stream,
+        )
+        .await
+    }
+}
+
+fn resolve_reasoning_parser(provider: &Provider) -> ReasoningParser {
+    if provider.reasoning_parser != ReasoningParser::Auto {
+        return provider.reasoning_parser;
+    }
+    infer_reasoning_parser(&provider.model)
+}
+
+fn infer_reasoning_parser(model: &str) -> ReasoningParser {
+    let model = model.to_ascii_lowercase();
+    if model.contains("qwq")
+        || model.contains("deepseek-r1")
+        || model.contains("deepseek_r1")
+        || model.contains("deepseek-reasoner")
+    {
+        ReasoningParser::DeepseekR1
+    } else if model.contains("qwen3")
+        || model.contains("qwen-3.")
+        || model.contains("qwen-3-")
+        || model.ends_with("qwen-3")
+    {
+        ReasoningParser::Qwen3
+    } else if model.contains("deepseek-v3") || model.contains("deepseek_v3") {
+        ReasoningParser::DeepseekV3
+    } else if model.contains("glm-4.5") || model.contains("glm4.5") {
+        ReasoningParser::Glm45
+    } else if model.contains("gemma-4") || model.contains("gemma4") {
+        ReasoningParser::Gemma4
+    } else if model.contains("granite-3.2") || model.contains("granite_3.2") {
+        ReasoningParser::Granite
+    } else {
+        ReasoningParser::Openai
+    }
+}
+
+fn normalized_reasoning_effort(reasoning_effort: &str) -> &str {
+    match reasoning_effort {
+        "low" => "low",
+        "medium" => "medium",
+        "high" => "high",
+        _ => "none",
+    }
+}
+
+fn thinking_token_budget(reasoning_effort: &str, context_size: usize) -> Option<usize> {
+    let desired = match reasoning_effort {
+        "low" => 1_024,
+        "medium" => 4_096,
+        "high" => 16_384,
+        _ => return None,
+    };
+    Some(desired.min((context_size / 2).max(256)))
+}
+
+fn build_chat_completions_body(
+    provider: &Provider,
+    parser: ReasoningParser,
+    system: &str,
+    user: &str,
+    reasoning_effort: &str,
+) -> Value {
+    let effort = normalized_reasoning_effort(reasoning_effort);
+    let thinking = effort != "none";
+    let mut body = json!({
+        "model": provider.model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": user }
+        ],
+        "reasoning_effort": effort,
+        "stream": true,
+    });
+    match parser {
+        ReasoningParser::Qwen3 | ReasoningParser::Gemma4 => {
+            body["chat_template_kwargs"] = json!({ "enable_thinking": thinking });
+        }
+        ReasoningParser::DeepseekV3 | ReasoningParser::Granite => {
+            body["chat_template_kwargs"] = json!({ "thinking": thinking });
+        }
+        _ => {}
+    }
+    if matches!(
+        parser,
+        ReasoningParser::Qwen3 | ReasoningParser::DeepseekR1 | ReasoningParser::DeepseekV3
+    ) {
+        if let Some(budget) = thinking_token_budget(effort, provider.context_size) {
+            body["thinking_token_budget"] = json!(budget);
+        }
+    }
+    body
+}
+
+async fn call_chat_completions(
+    data: &AppData,
+    provider: &Provider,
+    parser: ReasoningParser,
+    system: &str,
+    user: &str,
+    reasoning_effort: &str,
+    stream: Option<StreamCallback>,
+) -> Result<String, AiError> {
+    let body = build_chat_completions_body(provider, parser, system, user, reasoning_effort);
+    let client = build_streaming_client(
+        provider.proxy_mode,
+        &data.settings.proxy_url,
+        data.settings.ai_timeout_seconds,
+    )?;
+    let stream = stream.map(|callback| {
+        Arc::new(move |content: String| callback(strip_reasoning_markup(&content)))
+            as StreamCallback
+    });
+    let content = send_chat_completions_request(
+        &client,
+        &endpoint(&provider.base_url, "/chat/completions"),
+        &body,
+        (!provider.api_key.trim().is_empty()).then_some(provider.api_key.trim()),
+        stream,
+    )
+    .await?;
+    Ok(strip_reasoning_markup(&content))
+}
+
+fn strip_reasoning_markup(content: &str) -> String {
+    if let Some((_, answer)) = content.rsplit_once("</think>") {
+        answer.trim_start().to_string()
+    } else if content.contains("<think>") {
+        String::new()
+    } else {
+        content.to_string()
+    }
+}
+
 async fn call_responses(
     data: &AppData,
     provider: &Provider,
@@ -524,6 +680,51 @@ async fn call_responses(
         stream,
     )
     .await
+}
+
+async fn send_chat_completions_request(
+    client: &Client,
+    endpoint: &str,
+    body: &Value,
+    api_key: Option<&str>,
+    stream: Option<StreamCallback>,
+) -> Result<String, AiError> {
+    let mut last_error = None;
+    for attempt in 1..=MAX_REQUEST_ATTEMPTS {
+        match send_attempt(client, endpoint, body, api_key).await {
+            Ok(response) if response.status().is_success() => {
+                return read_chat_completions_stream(response, stream).await;
+            }
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+                let body = response
+                    .text()
+                    .await
+                    .map_err(|error| request_error("reading provider error response", error))?;
+                return Err(parse_provider_json(
+                    ProviderResponse {
+                        status,
+                        headers,
+                        body,
+                    },
+                    "OpenAI-compatible provider",
+                )
+                .unwrap_err_or_http());
+            }
+            Err(error) if retryable_request_error(&error) && attempt < MAX_REQUEST_ATTEMPTS => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(250 * attempt as u64)).await;
+            }
+            Err(error) => {
+                return Err(request_error("Chat Completions request", error));
+            }
+        }
+    }
+    Err(request_error(
+        "Chat Completions request",
+        last_error.expect("a request attempt must fail before retry exhaustion"),
+    ))
 }
 
 async fn send_responses_request(
@@ -667,6 +868,129 @@ async fn read_responses_stream(
         ));
     }
     Ok(content)
+}
+
+async fn read_chat_completions_stream(
+    mut response: reqwest::Response,
+    stream: Option<StreamCallback>,
+) -> Result<String, AiError> {
+    let mut pending = Vec::new();
+    let mut raw = Vec::new();
+    let mut content = String::new();
+    let mut parse_error = None;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| request_error("reading streaming provider response", error))?
+    {
+        raw.extend_from_slice(&chunk);
+        pending.extend_from_slice(&chunk);
+        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+            let line = pending.drain(..=newline).collect::<Vec<_>>();
+            if let Err(error) =
+                append_chat_completion_stream_line(&line, &mut content, stream.as_ref())
+            {
+                parse_error.get_or_insert(error);
+            }
+        }
+    }
+    if !pending.is_empty() {
+        if let Err(error) =
+            append_chat_completion_stream_line(&pending, &mut content, stream.as_ref())
+        {
+            parse_error.get_or_insert(error);
+        }
+    }
+    if content.is_empty() {
+        if let Ok(body) = std::str::from_utf8(&raw) {
+            if let Ok(value) = serde_json::from_str::<Value>(body) {
+                append_chat_completion_value(&value, &mut content, stream.as_ref());
+            }
+        }
+    }
+    if let Some(error) = parse_error {
+        return Err(error);
+    }
+    if content.is_empty() {
+        return Err(AiError::Message(
+            "Chat Completions API returned no output text".to_string(),
+        ));
+    }
+    Ok(content)
+}
+
+fn append_chat_completion_stream_line(
+    line: &[u8],
+    content: &mut String,
+    stream: Option<&StreamCallback>,
+) -> Result<(), AiError> {
+    let line = std::str::from_utf8(line)
+        .map_err(|error| {
+            AiError::Message(format!(
+                "Chat Completions API returned invalid UTF-8: {error}"
+            ))
+        })?
+        .trim();
+    if line.is_empty() || line.starts_with(':') || line.starts_with("event:") {
+        return Ok(());
+    }
+    let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+    if payload == "[DONE]" || payload.is_empty() {
+        return Ok(());
+    }
+    let value: Value = serde_json::from_str(payload).map_err(|error| {
+        AiError::Message(format!(
+            "Chat Completions API returned invalid JSON: {error}; response: {payload}"
+        ))
+    })?;
+    if value.get("type").and_then(Value::as_str) == Some("error") || value.get("error").is_some() {
+        let message = value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("message").and_then(Value::as_str))
+            .unwrap_or("Chat Completions API returned an error event");
+        return Err(AiError::Message(message.to_string()));
+    }
+    append_chat_completion_value(&value, content, stream);
+    Ok(())
+}
+
+fn append_chat_completion_value(
+    value: &Value,
+    content: &mut String,
+    stream: Option<&StreamCallback>,
+) {
+    if let Some(delta) = value.pointer("/choices/0/delta/content") {
+        append_chat_content(delta, content, stream);
+        return;
+    }
+    if content.is_empty() {
+        if let Some(message) = value.pointer("/choices/0/message/content") {
+            append_chat_content(message, content, stream);
+        }
+    }
+}
+
+fn append_chat_content(value: &Value, content: &mut String, stream: Option<&StreamCallback>) {
+    let mut append = |text: &str| {
+        content.push_str(text);
+        if let Some(stream) = stream {
+            stream(content.clone());
+        }
+    };
+    if let Some(text) = value.as_str() {
+        append(text);
+    } else if let Some(parts) = value.as_array() {
+        for part in parts {
+            if let Some(text) = part
+                .get("text")
+                .and_then(Value::as_str)
+                .or_else(|| part.pointer("/text/value").and_then(Value::as_str))
+            {
+                append(text);
+            }
+        }
+    }
 }
 
 fn append_response_stream_line(
@@ -1021,11 +1345,31 @@ mod tests {
     use tokio_stream::wrappers::UnboundedReceiverStream;
 
     use super::{
-        append_response_stream_line, build_streaming_client, decode_responses_image,
-        document_summary_request, parse_batch_response, send_responses_request,
-        truncate_document_summary, ProxyMode, TranslateRequest, MAX_DOCUMENT_SUMMARY_CHARS,
+        append_chat_completion_stream_line, append_response_stream_line,
+        build_chat_completions_body, build_streaming_client, decode_responses_image,
+        document_summary_request, infer_reasoning_parser, parse_batch_response,
+        send_responses_request, strip_reasoning_markup, truncate_document_summary, Provider,
+        ProxyMode, ReasoningParser, TranslateRequest, MAX_DOCUMENT_SUMMARY_CHARS,
         SEGMENT_SEPARATOR,
     };
+
+    fn provider(model: &str) -> Provider {
+        Provider {
+            id: "provider".to_string(),
+            name: "Provider".to_string(),
+            base_url: "http://127.0.0.1:8000/v1".to_string(),
+            model: model.to_string(),
+            reasoning_parser: ReasoningParser::Auto,
+            api_key: String::new(),
+            proxy_mode: ProxyMode::None,
+            enabled: true,
+            supports_images: false,
+            context_size: 32_768,
+            max_segments: 16,
+            max_concurrent: 2,
+            text_translation_model: false,
+        }
+    }
 
     #[test]
     fn batch_response_uses_a_plain_delimiter() {
@@ -1070,6 +1414,85 @@ mod tests {
 
         assert!(summary.ends_with("..."));
         assert!(summary.chars().count() <= MAX_DOCUMENT_SUMMARY_CHARS + 3);
+    }
+
+    #[test]
+    fn reasoning_parser_is_inferred_from_mainstream_model_names() {
+        assert_eq!(
+            infer_reasoning_parser("Qwen/Qwen3.8-27B"),
+            ReasoningParser::Qwen3
+        );
+        assert_eq!(
+            infer_reasoning_parser("deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"),
+            ReasoningParser::DeepseekR1
+        );
+        assert_eq!(
+            infer_reasoning_parser("deepseek-ai/DeepSeek-V3.2"),
+            ReasoningParser::DeepseekV3
+        );
+        assert_eq!(
+            infer_reasoning_parser("openai/gpt-5.2"),
+            ReasoningParser::Openai
+        );
+    }
+
+    #[test]
+    fn qwen3_chat_body_controls_thinking_and_budget() {
+        let provider = provider("Qwen/Qwen3.8-27B");
+        let disabled = build_chat_completions_body(
+            &provider,
+            ReasoningParser::Qwen3,
+            "system",
+            "user",
+            "none",
+        );
+        assert_eq!(disabled["reasoning_effort"], "none");
+        assert_eq!(
+            disabled.pointer("/chat_template_kwargs/enable_thinking"),
+            Some(&json!(false))
+        );
+        assert!(disabled.get("thinking_token_budget").is_none());
+
+        let medium = build_chat_completions_body(
+            &provider,
+            ReasoningParser::Qwen3,
+            "system",
+            "user",
+            "medium",
+        );
+        assert_eq!(medium["reasoning_effort"], "medium");
+        assert_eq!(
+            medium.pointer("/chat_template_kwargs/enable_thinking"),
+            Some(&json!(true))
+        );
+        assert_eq!(medium["thinking_token_budget"], 4_096);
+    }
+
+    #[test]
+    fn chat_stream_ignores_reasoning_and_accumulates_final_content() {
+        let mut content = String::new();
+        append_chat_completion_stream_line(
+            br#"data: {"choices":[{"delta":{"reasoning":"internal"}}]}"#,
+            &mut content,
+            None,
+        )
+        .unwrap();
+        append_chat_completion_stream_line(
+            br#"data: {"choices":[{"delta":{"content":"final"}}]}"#,
+            &mut content,
+            None,
+        )
+        .unwrap();
+        assert_eq!(content, "final");
+    }
+
+    #[test]
+    fn raw_thinking_markup_is_removed_as_a_fallback() {
+        assert_eq!(
+            strip_reasoning_markup("<think>private</think>translated"),
+            "translated"
+        );
+        assert!(strip_reasoning_markup("<think>still thinking").is_empty());
     }
 
     #[test]

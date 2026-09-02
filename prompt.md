@@ -135,6 +135,10 @@ Unable to summarize document: Responses API returned no output text
 
 - 当AI是流式输出时，每当接收到消息时超时时间应该重置
 
+### 9/2
+
+- 我使用qwen3.8(vllm wit qwen3 reasoning parser)，当前推理开关/强度控制有问题。推理控制好像没有通用方法，但请支持主流模型，比如像vllm一样有一个reasoning parser的选项让用户选择、或根据模型名自动适配。
+
 ## TODO
 - 取消后再翻译可能有问题
 
