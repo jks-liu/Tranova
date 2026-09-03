@@ -6,7 +6,8 @@ use std::{
 
 use fontdb::{Database as FontDatabase, Family as FontFamily, Query as FontQuery, Style};
 use printpdf::{
-    FontId, Mm, Op, ParsedFont, PdfDocument, PdfPage, PdfSaveOptions, Point, Pt, TextItem,
+    Color, FontId, Op, ParsedFont, PdfDocument, PdfFontHandle, PdfParseOptions, PdfSaveOptions, Pt,
+    Rgb, TextItem, TextMatrix,
 };
 use quick_xml::{
     escape::{escape, unescape},
@@ -511,36 +512,210 @@ async fn translate_pdf(
     progress: &ProgressCallback,
     state: &mut BatchState,
 ) -> Result<Vec<u8>, FileError> {
-    let text = pdf_extract::extract_text_from_mem(bytes)
-        .map_err(|error| FileError::Message(format!("Unable to extract PDF text: {error}")))?;
-    let translated = translate_lines(
+    let mut document = parse_pdf(bytes)?;
+    let page_rotations = pdf_page_rotations(bytes)?;
+    let blocks = pdf_text_blocks(&document);
+    if blocks.is_empty() {
+        return Err(FileError::Message(
+            "Unable to translate PDF because it contains no selectable text".to_string(),
+        ));
+    }
+    let translated = translate_fragments(
         store,
         scheduler,
-        &text,
+        blocks.iter().map(|block| block.text.clone()).collect(),
         options,
         output_mode,
         counts,
         progress,
         state,
-        |line| !line.trim().is_empty(),
     )
     .await?;
-    render_translated_pdf(&translated)
+    render_translated_pdf(&mut document, &blocks, &translated, &page_rotations)
 }
 
-const PDF_FONT_SIZE: f32 = 11.0;
-const PDF_LINE_HEIGHT: f32 = 15.0;
-const PDF_LINES_PER_PAGE: usize = 48;
-const PDF_LINE_WIDTH_UNITS: usize = 88;
+const PDF_MIN_FONT_SIZE: f32 = 3.0;
+const PDF_LINE_HEIGHT_FACTOR: f32 = 1.15;
+const PDF_COLUMN_GAP_FACTOR: f32 = 2.5;
 
 struct PdfFont {
     parsed: ParsedFont,
     id: FontId,
 }
 
-fn render_translated_pdf(text: &str) -> Result<Vec<u8>, FileError> {
-    let mut document = PdfDocument::new("Tranova translated document");
-    let parsed_fonts = load_pdf_fonts(text)?;
+#[derive(Debug, Clone, PartialEq)]
+struct PdfTextBlock {
+    page_index: usize,
+    bbox: [f32; 4],
+    font_size: f32,
+    text: String,
+}
+
+#[derive(Debug)]
+struct PdfLineFragment {
+    bbox: [f32; 4],
+    font_size: f32,
+    text: String,
+}
+
+fn parse_pdf(bytes: &[u8]) -> Result<PdfDocument, FileError> {
+    let mut warnings = Vec::new();
+    let document = PdfDocument::parse(bytes, &PdfParseOptions::default(), &mut warnings)
+        .map_err(|error| FileError::Message(format!("Unable to parse PDF: {error}")))?;
+    if document.pages.is_empty() {
+        return Err(FileError::Message(
+            "Unable to translate PDF because it contains no pages".to_string(),
+        ));
+    }
+    Ok(document)
+}
+
+fn pdf_page_rotations(bytes: &[u8]) -> Result<Vec<i64>, FileError> {
+    let document = lopdf::Document::load_mem(bytes)
+        .map_err(|error| FileError::Message(format!("Unable to parse PDF: {error}")))?;
+    Ok(document
+        .get_pages()
+        .into_values()
+        .map(|page_id| inherited_pdf_page_number(&document, page_id, b"Rotate").unwrap_or(0))
+        .collect())
+}
+
+fn inherited_pdf_page_number(
+    document: &lopdf::Document,
+    page_id: lopdf::ObjectId,
+    key: &[u8],
+) -> Option<i64> {
+    let mut current_id = page_id;
+    for _ in 0..64 {
+        let dictionary = document.get_dictionary(current_id).ok()?;
+        if let Ok(value) = dictionary.get(key) {
+            return value.as_i64().ok();
+        }
+        current_id = dictionary.get(b"Parent").ok()?.as_reference().ok()?;
+    }
+    None
+}
+
+fn pdf_text_blocks(document: &PdfDocument) -> Vec<PdfTextBlock> {
+    let mut blocks = Vec::new();
+    for (page_index, page) in document.extract_text_boxes().into_iter().enumerate() {
+        let mut fragments = page
+            .lines
+            .into_iter()
+            .flat_map(split_pdf_line_fragments)
+            .collect::<Vec<_>>();
+        fragments.sort_by(|left, right| {
+            left.bbox[1]
+                .total_cmp(&right.bbox[1])
+                .then_with(|| left.bbox[0].total_cmp(&right.bbox[0]))
+        });
+
+        let mut page_blocks: Vec<PdfTextBlock> = Vec::new();
+        for fragment in fragments {
+            let destination = page_blocks
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| pdf_lines_share_paragraph(block, &fragment))
+                .min_by(|(_, left), (_, right)| {
+                    let left_gap = fragment.bbox[1] - left.bbox[3];
+                    let right_gap = fragment.bbox[1] - right.bbox[3];
+                    left_gap.total_cmp(&right_gap).then_with(|| {
+                        (fragment.bbox[0] - left.bbox[0])
+                            .abs()
+                            .total_cmp(&(fragment.bbox[0] - right.bbox[0]).abs())
+                    })
+                })
+                .map(|(index, _)| index);
+
+            if let Some(index) = destination {
+                let block = &mut page_blocks[index];
+                block.bbox = pdf_bbox_union(block.bbox, fragment.bbox);
+                block.font_size = block.font_size.max(fragment.font_size);
+                block.text.push(' ');
+                block.text.push_str(&fragment.text);
+            } else {
+                page_blocks.push(PdfTextBlock {
+                    page_index,
+                    bbox: fragment.bbox,
+                    font_size: fragment.font_size,
+                    text: fragment.text,
+                });
+            }
+        }
+        blocks.extend(page_blocks);
+    }
+    blocks
+}
+
+fn split_pdf_line_fragments(line: printpdf::text_boxes::TextLine) -> Vec<PdfLineFragment> {
+    let mut fragments: Vec<PdfLineFragment> = Vec::new();
+    for word in line.words {
+        if word.text.trim().is_empty() {
+            continue;
+        }
+        let starts_new_fragment = fragments.last().is_some_and(|fragment| {
+            word.bbox[0] - fragment.bbox[2]
+                > word.font_size.max(fragment.font_size) * PDF_COLUMN_GAP_FACTOR
+        });
+        if starts_new_fragment || fragments.is_empty() {
+            fragments.push(PdfLineFragment {
+                bbox: word.bbox,
+                font_size: word.font_size,
+                text: word.text,
+            });
+        } else if let Some(fragment) = fragments.last_mut() {
+            fragment.bbox = pdf_bbox_union(fragment.bbox, word.bbox);
+            fragment.font_size = fragment.font_size.max(word.font_size);
+            fragment.text.push(' ');
+            fragment.text.push_str(&word.text);
+        }
+    }
+    fragments
+}
+
+fn pdf_lines_share_paragraph(block: &PdfTextBlock, line: &PdfLineFragment) -> bool {
+    let font_size = block.font_size.max(line.font_size).max(1.0);
+    let vertical_gap = line.bbox[1] - block.bbox[3];
+    if !(-font_size * 0.2..=font_size * 0.9).contains(&vertical_gap) {
+        return false;
+    }
+    let font_ratio = block.font_size / line.font_size.max(0.1);
+    if !(0.75..=1.34).contains(&font_ratio) {
+        return false;
+    }
+    let overlap = (block.bbox[2].min(line.bbox[2]) - block.bbox[0].max(line.bbox[0])).max(0.0);
+    let narrow_width = (block.bbox[2] - block.bbox[0])
+        .min(line.bbox[2] - line.bbox[0])
+        .max(1.0);
+    let left_aligned = (block.bbox[0] - line.bbox[0]).abs() <= font_size * 1.5;
+    let previous_line_is_full =
+        (block.bbox[2] - block.bbox[0]) >= (line.bbox[2] - line.bbox[0]) * 0.7;
+    overlap / narrow_width >= 0.6 && left_aligned && previous_line_is_full
+}
+
+fn pdf_bbox_union(left: [f32; 4], right: [f32; 4]) -> [f32; 4] {
+    [
+        left[0].min(right[0]),
+        left[1].min(right[1]),
+        left[2].max(right[2]),
+        left[3].max(right[3]),
+    ]
+}
+
+fn render_translated_pdf(
+    document: &mut PdfDocument,
+    blocks: &[PdfTextBlock],
+    translated: &[String],
+    page_rotations: &[i64],
+) -> Result<Vec<u8>, FileError> {
+    if blocks.len() != translated.len() {
+        return Err(FileError::Message(
+            "Unable to build translated PDF because translated text does not match its layout"
+                .to_string(),
+        ));
+    }
+    let all_text = translated.join("\n");
+    let parsed_fonts = load_pdf_fonts(&all_text)?;
     let fonts = parsed_fonts
         .into_iter()
         .map(|parsed| {
@@ -548,19 +723,40 @@ fn render_translated_pdf(text: &str) -> Result<Vec<u8>, FileError> {
             PdfFont { parsed, id }
         })
         .collect::<Vec<_>>();
-    let lines = wrap_pdf_text(text);
-    let pages = lines
-        .chunks(PDF_LINES_PER_PAGE)
-        .map(|page_lines| build_pdf_page(page_lines, &fonts))
-        .collect::<Vec<_>>();
+
+    for page in &mut document.pages {
+        page.ops.retain(|operation| {
+            !matches!(
+                operation,
+                Op::ShowText { .. }
+                    | Op::MoveToNextLineShowText { .. }
+                    | Op::SetSpacingMoveAndShowText { .. }
+            )
+        });
+    }
+    for (block, text) in blocks.iter().zip(translated) {
+        let Some(page) = document.pages.get_mut(block.page_index) else {
+            return Err(FileError::Message(
+                "Unable to build translated PDF because a page is missing".to_string(),
+            ));
+        };
+        page.ops.extend(render_pdf_block(
+            block,
+            text,
+            page.media_box.height.0,
+            &fonts,
+        ));
+    }
+
     let mut warnings = Vec::new();
-    let bytes = document
-        .with_pages(if pages.is_empty() {
-            vec![build_pdf_page(&[String::new()], &fonts)]
-        } else {
-            pages
-        })
-        .save(&PdfSaveOptions::default(), &mut warnings);
+    let bytes = document.save(
+        &PdfSaveOptions {
+            subset_fonts: true,
+            ..PdfSaveOptions::default()
+        },
+        &mut warnings,
+    );
+    let bytes = restore_pdf_page_rotations(bytes, page_rotations)?;
     if bytes.starts_with(b"%PDF-") {
         Ok(bytes)
     } else {
@@ -568,6 +764,108 @@ fn render_translated_pdf(text: &str) -> Result<Vec<u8>, FileError> {
             "Unable to build translated PDF".to_string(),
         ))
     }
+}
+
+fn restore_pdf_page_rotations(
+    bytes: Vec<u8>,
+    page_rotations: &[i64],
+) -> Result<Vec<u8>, FileError> {
+    let mut document = lopdf::Document::load_mem(&bytes)
+        .map_err(|error| FileError::Message(format!("Unable to finalize PDF: {error}")))?;
+    let pages = document.get_pages().into_values().collect::<Vec<_>>();
+    if pages.len() != page_rotations.len() {
+        return Err(FileError::Message(
+            "Unable to finalize PDF because its page count changed".to_string(),
+        ));
+    }
+    for (page_id, rotation) in pages.into_iter().zip(page_rotations) {
+        if *rotation != 0 {
+            document
+                .get_dictionary_mut(page_id)
+                .map_err(|error| {
+                    FileError::Message(format!("Unable to finalize PDF page: {error}"))
+                })?
+                .set("Rotate", *rotation);
+        }
+    }
+    let mut output = Vec::with_capacity(bytes.len());
+    document
+        .save_to(&mut output)
+        .map_err(|error| FileError::Message(format!("Unable to finalize PDF: {error}")))?;
+    Ok(output)
+}
+
+fn render_pdf_block(
+    block: &PdfTextBlock,
+    text: &str,
+    page_height: f32,
+    fonts: &[PdfFont],
+) -> Vec<Op> {
+    let width = (block.bbox[2] - block.bbox[0]).max(1.0);
+    let height = (block.bbox[3] - block.bbox[1]).max(1.0);
+    let (font_size, lines) = fit_pdf_text(text, block.font_size, width, height, fonts);
+    let line_height = font_size * PDF_LINE_HEIGHT_FACTOR;
+    let mut operations = vec![
+        Op::SaveGraphicsState,
+        Op::SetFillColor {
+            col: Color::Rgb(Rgb::new(0.0, 0.0, 0.0, None)),
+        },
+        Op::StartTextSection,
+    ];
+    for (line_index, line) in lines.iter().enumerate() {
+        let baseline_from_top = block.bbox[1] + font_size * 0.82 + line_index as f32 * line_height;
+        operations.push(Op::SetTextMatrix {
+            matrix: TextMatrix::Raw([
+                1.0,
+                0.0,
+                0.0,
+                1.0,
+                block.bbox[0],
+                page_height - baseline_from_top,
+            ]),
+        });
+        for (font_index, run) in pdf_font_runs(line, fonts) {
+            operations.push(Op::SetFont {
+                font: PdfFontHandle::External(fonts[font_index].id.clone()),
+                size: Pt(font_size),
+            });
+            operations.push(Op::ShowText {
+                items: vec![TextItem::Text(run)],
+            });
+        }
+    }
+    operations.extend([Op::EndTextSection, Op::RestoreGraphicsState]);
+    operations
+}
+
+fn fit_pdf_text(
+    text: &str,
+    preferred_font_size: f32,
+    width: f32,
+    height: f32,
+    fonts: &[PdfFont],
+) -> (f32, Vec<String>) {
+    let cleaned = clean_pdf_text(text);
+    let mut font_size = preferred_font_size.clamp(PDF_MIN_FONT_SIZE, 96.0);
+    loop {
+        let lines = wrap_pdf_text(&cleaned, font_size, width, fonts);
+        let required_height = if lines.is_empty() {
+            0.0
+        } else {
+            font_size + (lines.len() - 1) as f32 * font_size * PDF_LINE_HEIGHT_FACTOR
+        };
+        if required_height <= height + font_size * 0.25 || font_size <= PDF_MIN_FONT_SIZE {
+            return (font_size, lines);
+        }
+        font_size = (font_size - 0.25).max(PDF_MIN_FONT_SIZE);
+    }
+}
+
+fn clean_pdf_text(text: &str) -> String {
+    text.chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+        .map(|character| if character == '\t' { ' ' } else { character })
+        .collect()
 }
 
 fn load_pdf_fonts(text: &str) -> Result<Vec<ParsedFont>, FileError> {
@@ -701,34 +999,6 @@ fn best_pdf_font(
     best
 }
 
-fn build_pdf_page(lines: &[String], fonts: &[PdfFont]) -> PdfPage {
-    let mut operations = vec![
-        Op::StartTextSection,
-        Op::SetTextCursor {
-            pos: Point::new(Mm(18.0), Mm(279.0)),
-        },
-        Op::SetLineHeight {
-            lh: Pt(PDF_LINE_HEIGHT),
-        },
-    ];
-    for line in lines {
-        for (font_index, text) in pdf_font_runs(line, fonts) {
-            let font = fonts[font_index].id.clone();
-            operations.push(Op::SetFontSize {
-                size: Pt(PDF_FONT_SIZE),
-                font: font.clone(),
-            });
-            operations.push(Op::WriteText {
-                items: vec![TextItem::Text(text)],
-                font,
-            });
-        }
-        operations.push(Op::AddLineBreak);
-    }
-    operations.push(Op::EndTextSection);
-    PdfPage::new(Mm(210.0), Mm(297.0), operations)
-}
-
 fn pdf_font_runs(line: &str, fonts: &[PdfFont]) -> Vec<(usize, String)> {
     let mut runs: Vec<(usize, String)> = Vec::new();
     for character in line.chars() {
@@ -747,7 +1017,7 @@ fn pdf_font_runs(line: &str, fonts: &[PdfFont]) -> Vec<(usize, String)> {
     runs
 }
 
-fn wrap_pdf_text(text: &str) -> Vec<String> {
+fn wrap_pdf_text(text: &str, font_size: f32, maximum_width: f32, fonts: &[PdfFont]) -> Vec<String> {
     let mut lines = Vec::new();
     for source_line in text.split('\n') {
         let characters = source_line
@@ -761,18 +1031,21 @@ fn wrap_pdf_text(text: &str) -> Vec<String> {
         }
         let mut start = 0;
         while start < characters.len() {
-            let mut width = 0;
+            let mut width = 0.0;
             let mut end = start;
             let mut whitespace = None;
             while end < characters.len() {
-                let next_width = pdf_character_width(characters[end]);
-                if end > start && width + next_width > PDF_LINE_WIDTH_UNITS {
+                let next_width = pdf_character_width(characters[end], font_size, fonts);
+                if end > start && width + next_width > maximum_width {
                     break;
                 }
                 width += next_width;
                 if characters[end].is_whitespace() {
                     whitespace = Some(end);
                 }
+                end += 1;
+            }
+            if end == start {
                 end += 1;
             }
             if end < characters.len() {
@@ -790,21 +1063,16 @@ fn wrap_pdf_text(text: &str) -> Vec<String> {
     lines
 }
 
-fn pdf_character_width(character: char) -> usize {
-    if matches!(
-        character as u32,
-        0x1100..=0x11ff
-            | 0x2e80..=0xa4cf
-            | 0xac00..=0xd7af
-            | 0xf900..=0xfaff
-            | 0xfe10..=0xfe6f
-            | 0xff00..=0xffef
-            | 0x1f000..=0x1faff
-    ) {
-        2
-    } else {
-        1
-    }
+fn pdf_character_width(character: char, font_size: f32, fonts: &[PdfFont]) -> f32 {
+    fonts
+        .iter()
+        .find_map(|font| {
+            let glyph = font.parsed.lookup_glyph_index(character as u32)?;
+            let width = font.parsed.get_glyph_width(glyph)? as f32;
+            let units_per_em = font.parsed.units_per_em.max(1) as f32;
+            Some(width / units_per_em * font_size)
+        })
+        .unwrap_or(font_size * 0.5)
 }
 
 fn extract_summary_text(filename: &str, bytes: &[u8], maximum: usize) -> Result<String, FileError> {
@@ -814,8 +1082,12 @@ fn extract_summary_text(filename: &str, bytes: &[u8], maximum: usize) -> Result<
         .unwrap_or("")
         .to_ascii_lowercase();
     let mut text = match extension.as_str() {
-        "pdf" => pdf_extract::extract_text_from_mem(bytes)
-            .map_err(|error| FileError::Message(format!("Unable to extract PDF text: {error}")))?,
+        "pdf" => parse_pdf(bytes)?
+            .extract_text()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n"),
         "docx" | "pptx" | "xlsx" => {
             let mut output = String::new();
             for (name, is_directory, contents) in unpack_office(bytes)? {
@@ -1938,11 +2210,72 @@ fn output_media_type(filename: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        make_batches, output_filename, output_media_type, partial_batch_item_count,
-        render_fragment, render_translated_pdf, replace_xml_text, split_chunks,
-        surrounding_whitespace, wrap_pdf_text, PendingPart,
+        load_pdf_fonts, make_batches, output_filename, output_media_type, parse_pdf,
+        partial_batch_item_count, pdf_page_rotations, pdf_text_blocks, render_fragment,
+        render_translated_pdf, replace_xml_text, split_chunks, surrounding_whitespace,
+        wrap_pdf_text, PdfFont, PendingPart,
     };
     use crate::{ai::SEGMENT_SEPARATOR, models::FileOutputMode};
+    use printpdf::{
+        Color, Mm, Op, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Pt, Rect, Rgb,
+        TextItem, TextMatrix,
+    };
+
+    fn source_pdf() -> Vec<u8> {
+        let mut document = PdfDocument::new("Source layout");
+        let parsed = load_pdf_fonts("Original first line Original second line Page two")
+            .unwrap()
+            .remove(0);
+        let font = document.add_font(&parsed);
+        let text_ops = |lines: &[(&str, f32, f32)]| {
+            let mut operations = vec![Op::StartTextSection];
+            for (text, x, y) in lines {
+                operations.extend([
+                    Op::SetTextMatrix {
+                        matrix: TextMatrix::Raw([1.0, 0.0, 0.0, 1.0, *x, *y]),
+                    },
+                    Op::SetFont {
+                        font: PdfFontHandle::External(font.clone()),
+                        size: Pt(12.0),
+                    },
+                    Op::ShowText {
+                        items: vec![TextItem::Text((*text).to_string())],
+                    },
+                ]);
+            }
+            operations.push(Op::EndTextSection);
+            operations
+        };
+        let mut first_page_ops = vec![
+            Op::SetFillColor {
+                col: Color::Rgb(Rgb::new(0.2, 0.4, 0.8, None)),
+            },
+            Op::DrawRectangle {
+                rectangle: Rect::from_xywh(Pt(8.0), Pt(8.0), Pt(40.0), Pt(20.0)),
+            },
+        ];
+        first_page_ops.extend(text_ops(&[
+            ("Original first line", 35.0, 180.0),
+            ("Original second line", 35.0, 164.0),
+        ]));
+        let pages = vec![
+            PdfPage::new(Mm(160.0), Mm(90.0), first_page_ops),
+            PdfPage::new(Mm(100.0), Mm(150.0), text_ops(&[("Page two", 24.0, 380.0)])),
+        ];
+        let mut warnings = Vec::new();
+        let bytes = document
+            .with_pages(pages)
+            .save(&PdfSaveOptions::default(), &mut warnings);
+        let mut source = lopdf::Document::load_mem(&bytes).unwrap();
+        let second_page = source.get_pages()[&2];
+        source
+            .get_dictionary_mut(second_page)
+            .unwrap()
+            .set("Rotate", 90);
+        let mut rotated = Vec::new();
+        source.save_to(&mut rotated).unwrap();
+        rotated
+    }
 
     #[test]
     fn splitting_preserves_all_content() {
@@ -2022,18 +2355,71 @@ mod tests {
     }
 
     #[test]
-    fn translated_pdf_is_valid_and_contains_the_translation() {
-        let pdf = render_translated_pdf("Translated PDF\nSecond line").unwrap();
+    fn translated_pdf_preserves_pages_and_non_text_content() {
+        let source = source_pdf();
+        let mut document = parse_pdf(&source).unwrap();
+        let rotations = pdf_page_rotations(&source).unwrap();
+        assert_eq!(rotations, [0, 90]);
+        let source_widths = document
+            .pages
+            .iter()
+            .map(|page| (page.media_box.width.0, page.media_box.height.0))
+            .collect::<Vec<_>>();
+        let blocks = pdf_text_blocks(&document);
+        assert_eq!(
+            blocks.iter().filter(|block| block.page_index == 0).count(),
+            1
+        );
+        assert_eq!(
+            blocks.iter().filter(|block| block.page_index == 1).count(),
+            1
+        );
+        let translations = blocks
+            .iter()
+            .map(|block| format!("Translated page {}", block.page_index + 1))
+            .collect::<Vec<_>>();
+        let pdf = render_translated_pdf(&mut document, &blocks, &translations, &rotations).unwrap();
         assert!(pdf.starts_with(b"%PDF-"));
-        let extracted = pdf_extract::extract_text_from_mem(&pdf).unwrap();
-        assert!(extracted.contains("Translated PDF"));
-        assert!(extracted.contains("Second line"));
+        assert_eq!(pdf_page_rotations(&pdf).unwrap(), rotations);
+
+        let translated = parse_pdf(&pdf).unwrap();
+        assert_eq!(translated.pages.len(), 2);
+        assert_eq!(
+            translated
+                .pages
+                .iter()
+                .map(|page| (page.media_box.width.0, page.media_box.height.0))
+                .collect::<Vec<_>>(),
+            source_widths
+        );
+        assert!(translated.pages[0]
+            .ops
+            .iter()
+            .any(|operation| matches!(operation, Op::DrawRectangle { .. })));
+        let extracted = translated
+            .extract_text()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n");
+        let normalized = extracted.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized.contains("Translated page 1"));
+        assert!(normalized.contains("Translated page 2"));
+        assert!(!extracted.contains("Original"));
     }
 
     #[test]
     fn pdf_text_wraps_long_lines_without_losing_characters() {
-        let text = "一".repeat(100);
-        let lines = wrap_pdf_text(&text);
+        let text = "a".repeat(100);
+        let fonts = load_pdf_fonts(&text)
+            .unwrap()
+            .into_iter()
+            .map(|parsed| PdfFont {
+                parsed,
+                id: printpdf::FontId::new(),
+            })
+            .collect::<Vec<_>>();
+        let lines = wrap_pdf_text(&text, 12.0, 80.0, &fonts);
         assert!(lines.len() > 1);
         assert_eq!(lines.concat(), text);
     }
